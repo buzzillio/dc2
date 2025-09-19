@@ -13,7 +13,6 @@ from net.models import LeNet
 from net.quantization import apply_weight_sharing
 import util
 from net import vgg
-from net import vgg
 
 os.makedirs('saves', exist_ok=True)
 
@@ -21,18 +20,14 @@ os.makedirs('saves', exist_ok=True)
 parser = argparse.ArgumentParser(description='PyTorch MNIST pruning from deep compression paper')
 parser.add_argument('--model', type=str, default='lenet', choices=['lenet', 'vgg'],
                     help='model to use (default: lenet)')
-parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
+parser.add_argument('--batch-size', type=int, default=50, metavar='N',
+                    help='input batch size for training (default: 50)')
 parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                     help='input batch size for testing (default: 1000)')
-parser.add_argument('--epochs', type=int, default=300, metavar='N',
-                    help='number of epochs to train (default: 300)')
-parser.add_argument('--lr', type=float, default=0.05, metavar='LR',
-                    help='learning rate (default: 0.05)')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
-                    metavar='W', help='weight decay (default: 5e-4)')
+parser.add_argument('--epochs', type=int, default=100, metavar='N',
+                    help='number of epochs to train (default: 100)')
+parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
+                    help='learning rate (default: 0.01)')
 parser.add_argument('--device', type=str, default='cuda',
                     help='device to use (cuda, mps, cpu)')
 parser.add_argument('--seed', type=int, default=42, metavar='S',
@@ -138,15 +133,8 @@ else: # lenet
 print(model)
 util.print_model_parameters(model)
 
-# Set up optimizer
-if args.model == 'vgg':
-    optimizer = optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-else: # lenet
-    # NOTE : `weight_decay` term denotes L2 regularization loss term
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
-
+# NOTE : `weight_decay` term denotes L2 regularization loss term
+optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
 initial_optimizer_state_dict = optimizer.state_dict()
 
 
@@ -219,32 +207,9 @@ def collect_activation_statistics(model, data_loader, device, activation_thresho
     print(f'Collected activation statistics from {processed_samples} samples for TF-IDF pruning.')
     return stats
 
-def train_initial(epochs):
-    """Initial training without any gradient masking."""
+def train(epochs):
     model.train()
     for epoch in range(epochs):
-        if args.model == 'vgg':
-            adjust_learning_rate(optimizer, epoch)
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader))
-        for batch_idx, (data, target) in pbar:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.nll_loss(output, target)
-            loss.backward()
-            optimizer.step()
-            if batch_idx % args.log_interval == 0:
-                done = batch_idx * len(data)
-                percentage = 100. * batch_idx / len(train_loader)
-                pbar.set_description(f'Train Epoch: {epoch} [{done:5}/{len(train_loader.dataset)} ({percentage:3.0f}%)]  Loss: {loss.item():.6f}')
-
-
-def train_retrain(epochs):
-    """Retraining with gradient masking for pruned weights."""
-    model.train()
-    for epoch in range(epochs):
-        if args.model == 'vgg':
-            adjust_learning_rate(optimizer, epoch)
         pbar = tqdm(enumerate(train_loader), total=len(train_loader))
         for batch_idx, (data, target) in pbar:
             data, target = data.to(device), target.to(device)
@@ -257,18 +222,10 @@ def train_retrain(epochs):
             for name, p in model.named_parameters():
                 if 'mask' in name:
                     continue
-                if p.grad is None:
-                    continue
-                
-                # Find the mask for the given parameter
-                mask_name = name.replace('.weight', '.mask')
-                # get the module
-                module_name = '.'.join(name.split('.')[:-1])
-                module = dict(model.named_modules())[module_name]
-                mask = module.mask
-
-                # Zero out the gradients
-                p.grad.data.mul_(mask)
+                tensor = p.data.cpu().numpy()
+                grad_tensor = p.grad.data.cpu().numpy()
+                grad_tensor = np.where(tensor==0, 0, grad_tensor)
+                p.grad.data = torch.from_numpy(grad_tensor).to(device)
 
             optimizer.step()
             if batch_idx % args.log_interval == 0:
@@ -295,16 +252,9 @@ def test():
     return accuracy
 
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 2 every 30 epochs"""
-    lr = args.lr * (0.5 ** (epoch // 30))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
 # Initial training
 print("--- Initial training ---")
-train_initial(args.epochs)
+train(args.epochs)
 accuracy = test()
 util.log(args.log, f"initial_accuracy {accuracy}")
 torch.save(model, f"saves/initial_model.ptmodel")
@@ -341,15 +291,8 @@ util.print_nonzeros(model)
 
 # Retrain
 print("--- Retraining ---")
-# Re-initialize the optimizer to be sure it is correctly configured for the pruned model
-if args.model == 'vgg':
-    optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                          momentum=args.momentum,
-                          weight_decay=args.weight_decay)
-else: # lenet
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
-
-train_retrain(args.epochs)
+optimizer.load_state_dict(initial_optimizer_state_dict) # Reset the optimizer
+train(args.epochs)
 torch.save(model, f"saves/model_after_retraining.ptmodel")
 accuracy = test()
 util.log(args.log, f"accuracy_after_retraining {accuracy}")
