@@ -273,18 +273,23 @@ def adjust_learning_rate(optimizer, epoch):
         param_group['lr'] = lr
 
 
-# Initial training
+# --- Main Execution Logic ---
+
+# 1. Initial Training
 print("--- Initial training ---")
 train(args.epochs)
 accuracy = test()
 util.log(args.log, f"initial_accuracy {accuracy}")
 torch.save(model, f"saves/initial_model.ptmodel")
+
+# --- Pruning Phase ---
 print("--- Before pruning ---")
 util.print_nonzeros(model)
 
-# Pruning
+# 2. Prune the model
 if args.pruning_method == 'tfidf':
     print('--- Collecting statistics for TF-IDF pruning ---')
+    # This is the ONLY place this function should be called.
     activation_stats = collect_activation_statistics(
         model,
         train_loader,
@@ -303,14 +308,15 @@ if args.pruning_method == 'tfidf':
         tf_power=args.tfidf_tf_power,
         weight_power=args.tfidf_weight_power,
     )
-else:
+else: # 'std'
     model.prune_by_std(args.sensitivity)
+
 accuracy = test()
 util.log(args.log, f"accuracy_after_pruning {accuracy}")
 print("--- After pruning ---")
 util.print_nonzeros(model)
 
-# Retrain
+# 3. Retrain the pruned model
 print("--- Retraining ---")
 optimizer.load_state_dict(initial_optimizer_state_dict) # Reset the optimizer
 train(args.epochs)
