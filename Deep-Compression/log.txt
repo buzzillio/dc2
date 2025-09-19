@@ -1,0 +1,2 @@
+initial_accuracy 53.58
+accuracy_after_pruning 10.48
