@@ -123,7 +123,12 @@ class PruningModule(Module):
                 idf_component = idf_component + idf_add
             idf_component = idf_component.clamp(min=0.0).pow(idf_power)
 
-            scores = weight_component * tf_component.unsqueeze(0) * idf_component.unsqueeze(0)
+            # Reshape stats for broadcasting with weights
+            if weight_component.dim() > 2: # This is a Conv layer
+                tf_component = tf_component.reshape(1, -1, 1, 1)
+                idf_component = idf_component.reshape(1, -1, 1, 1)
+
+            scores = weight_component * tf_component * idf_component
             scores = scores * mask
 
             alive_mask = mask > 0
