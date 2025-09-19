@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import math
 import torch
+import numpy as np
 from .prune import PruningModule
 
 
