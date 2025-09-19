@@ -333,7 +333,14 @@ util.print_nonzeros(model)
 
 # Retrain
 print("--- Retraining ---")
-optimizer.load_state_dict(initial_optimizer_state_dict) # Reset the optimizer
+# Re-initialize the optimizer to be sure it is correctly configured for the pruned model
+if args.model == 'vgg':
+    optimizer = optim.SGD(model.parameters(), lr=args.lr,
+                          momentum=args.momentum,
+                          weight_decay=args.weight_decay)
+else: # lenet
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
+
 train_retrain(args.epochs)
 torch.save(model, f"saves/model_after_retraining.ptmodel")
 accuracy = test()
