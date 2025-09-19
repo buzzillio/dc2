@@ -21,14 +21,18 @@ os.makedirs('saves', exist_ok=True)
 parser = argparse.ArgumentParser(description='PyTorch MNIST pruning from deep compression paper')
 parser.add_argument('--model', type=str, default='lenet', choices=['lenet', 'vgg'],
                     help='model to use (default: lenet)')
-parser.add_argument('--batch-size', type=int, default=50, metavar='N',
-                    help='input batch size for training (default: 50)')
+parser.add_argument('--batch-size', type=int, default=128, metavar='N',
+                    help='input batch size for training (default: 128)')
 parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                     help='input batch size for testing (default: 1000)')
-parser.add_argument('--epochs', type=int, default=100, metavar='N',
-                    help='number of epochs to train (default: 100)')
-parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
-                    help='learning rate (default: 0.01)')
+parser.add_argument('--epochs', type=int, default=300, metavar='N',
+                    help='number of epochs to train (default: 300)')
+parser.add_argument('--lr', type=float, default=0.05, metavar='LR',
+                    help='learning rate (default: 0.05)')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
+                    metavar='W', help='weight decay (default: 5e-4)')
 parser.add_argument('--device', type=str, default='cuda',
                     help='device to use (cuda, mps, cpu)')
 parser.add_argument('--seed', type=int, default=42, metavar='S',
@@ -134,8 +138,15 @@ else: # lenet
 print(model)
 util.print_model_parameters(model)
 
-# NOTE : `weight_decay` term denotes L2 regularization loss term
-optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
+# Set up optimizer
+if args.model == 'vgg':
+    optimizer = optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+else: # lenet
+    # NOTE : `weight_decay` term denotes L2 regularization loss term
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
+
 initial_optimizer_state_dict = optimizer.state_dict()
 
 
@@ -211,6 +222,8 @@ def collect_activation_statistics(model, data_loader, device, activation_thresho
 def train(epochs):
     model.train()
     for epoch in range(epochs):
+        if args.model == 'vgg':
+            adjust_learning_rate(optimizer, epoch)
         pbar = tqdm(enumerate(train_loader), total=len(train_loader))
         for batch_idx, (data, target) in pbar:
             data, target = data.to(device), target.to(device)
@@ -223,10 +236,10 @@ def train(epochs):
             for name, p in model.named_parameters():
                 if 'mask' in name:
                     continue
-                tensor = p.data.cpu().numpy()
-                grad_tensor = p.grad.data.cpu().numpy()
-                grad_tensor = np.where(tensor==0, 0, grad_tensor)
-                p.grad.data = torch.from_numpy(grad_tensor).to(device)
+                if p.grad is None:
+                    continue
+                # Use the mask to directly zero out gradients on the GPU
+                p.grad.data.mul_(p.data.ne(0).float())
 
             optimizer.step()
             if batch_idx % args.log_interval == 0:
@@ -251,6 +264,13 @@ def test():
         accuracy = 100. * correct / len(test_loader.dataset)
         print(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)')
     return accuracy
+
+
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 2 every 30 epochs"""
+    lr = args.lr * (0.5 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
 
 # Initial training
