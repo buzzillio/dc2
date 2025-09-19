@@ -237,7 +237,7 @@ class MaskedLinear(Module):
             self.bias.data.uniform_(-stdv, stdv)
 
     def forward(self, input):
-        return F.linear(input, self.weight * self.mask, self.bias)
+        return F.linear(input, self.weight, self.bias)
 
     def __repr__(self):
         return self.__class__.__name__ + '(' \

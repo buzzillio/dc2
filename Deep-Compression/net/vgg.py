@@ -17,7 +17,7 @@ class MaskedConv2d(nn.Conv2d):
         self.mask = nn.Parameter(torch.ones(self.weight.shape), requires_grad=False)
 
     def forward(self, x):
-        return nn.functional.conv2d(x, self.weight * self.mask, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        return nn.functional.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
     def prune(self, threshold):
         weight_dev = self.weight.device
@@ -54,7 +54,7 @@ class MaskedLinear(nn.Linear):
         self.mask = nn.Parameter(torch.ones(self.weight.shape), requires_grad=False)
 
     def forward(self, x):
-        return nn.functional.linear(x, self.weight * self.mask, self.bias)
+        return nn.functional.linear(x, self.weight, self.bias)
     
     def prune(self, threshold):
         weight_dev = self.weight.device
