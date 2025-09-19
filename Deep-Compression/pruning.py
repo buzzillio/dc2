@@ -259,8 +259,16 @@ def train_retrain(epochs):
                     continue
                 if p.grad is None:
                     continue
-                # Use the mask to directly zero out gradients on the GPU
-                p.grad.data.mul_(p.data.ne(0).float())
+                
+                # Find the mask for the given parameter
+                mask_name = name.replace('.weight', '.mask')
+                # get the module
+                module_name = '.'.join(name.split('.')[:-1])
+                module = dict(model.named_modules())[module_name]
+                mask = module.mask
+
+                # Zero out the gradients
+                p.grad.data.mul_(mask)
 
             optimizer.step()
             if batch_idx % args.log_interval == 0:
