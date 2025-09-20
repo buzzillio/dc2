@@ -1,0 +1,3 @@
+accuracy_after_pruning,accuracy_after_retraining,accuracy_initial,alive_parameters,compression_ratio,epochs,mode,model,neuronrank_activation_threshold,neuronrank_global_threshold,neuronrank_idf_add,neuronrank_idf_power,neuronrank_idf_smooth,neuronrank_percentile,neuronrank_tf_power,neuronrank_weight_power,pruning_method,retrain_epochs,seed,sparsity,target_sparsity,total_parameters,vgg_arch
+76.92,96.28,92.25,27030,9.863485016648168,1,prune,lenet,,,,,,,,,std,1,42,0.8986159558906268,0.9,266610,vgg19
+90.55,95.35,92.25,27030,9.863485016648168,1,prune,lenet,0.05,False,1.0,1.0,1.0,,1.0,1.0,neuronrank,1,42,0.8986159558906268,0.9,266610,vgg19
