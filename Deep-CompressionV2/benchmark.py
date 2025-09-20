@@ -94,17 +94,27 @@ def aggregate_results(records):
     aggregates = []
     for (epochs, target, method), items in grouped.items():
         compression_vals = [itm['compression_ratio'] for itm in items]
-        accuracy_vals = [itm['accuracy_after_retraining'] for itm in items]
+        accuracy_pruned_vals = [itm['accuracy_after_pruning'] for itm in items]
+        accuracy_retrained_vals = [itm['accuracy_after_retraining'] for itm in items]
+        alive_vals = [itm['alive_parameters'] for itm in items]
+        total_vals = [itm['total_parameters'] for itm in items]
         aggregates.append({
             'epochs': epochs,
             'target_sparsity': target,
             'pruning_method': method,
             'compression_ratio_mean': mean(compression_vals),
             'compression_ratio_std': pstdev(compression_vals) if len(compression_vals) > 1 else 0.0,
-            'accuracy_mean': mean(accuracy_vals),
-            'accuracy_std': pstdev(accuracy_vals) if len(accuracy_vals) > 1 else 0.0,
+            'accuracy_after_pruning_mean': mean(accuracy_pruned_vals),
+            'accuracy_after_pruning_std': pstdev(accuracy_pruned_vals) if len(accuracy_pruned_vals) > 1 else 0.0,
+            'accuracy_after_retraining_mean': mean(accuracy_retrained_vals),
+            'accuracy_after_retraining_std': pstdev(accuracy_retrained_vals) if len(accuracy_retrained_vals) > 1 else 0.0,
+            'alive_parameters_mean': mean(alive_vals),
+            'alive_parameters_std': pstdev(alive_vals) if len(alive_vals) > 1 else 0.0,
+            'total_parameters_mean': mean(total_vals),
+            'total_parameters_std': pstdev(total_vals) if len(total_vals) > 1 else 0.0,
         })
     return aggregates
+
 
 
 def ensure_output_dir(path):
@@ -127,8 +137,8 @@ def create_plot(aggregates, model, output_dir):
                 continue
             method_subset.sort(key=lambda item: item['compression_ratio_mean'])
             x = [item['compression_ratio_mean'] for item in method_subset]
-            y = [item['accuracy_mean'] for item in method_subset]
-            y_err = [item['accuracy_std'] for item in method_subset]
+            y = [item['accuracy_after_retraining_mean'] for item in method_subset]
+            y_err = [item['accuracy_after_retraining_std'] for item in method_subset]
             label = f"{method}"
             plt.errorbar(x, y, yerr=y_err, marker='o', capsize=3, label=label)
 
@@ -148,7 +158,11 @@ def print_summary(aggregates):
         print('No metrics collected; nothing to summarise.')
         return
 
-    aggregates = sorted(aggregates, key=lambda item: (item['epochs'], item['pruning_method'], item['target_sparsity']))
+    aggregates = sorted(
+        aggregates,
+        key=lambda item: (item['epochs'], item['pruning_method'], item['target_sparsity'])
+    )
+
     current_epoch = None
     print('\n===== Benchmark Summary =====')
     for entry in aggregates:
@@ -157,19 +171,37 @@ def print_summary(aggregates):
         target = entry['target_sparsity']
         comp = entry['compression_ratio_mean']
         comp_std = entry['compression_ratio_std']
-        acc = entry['accuracy_mean']
-        acc_std = entry['accuracy_std']
 
         if epochs != current_epoch:
             current_epoch = epochs
-            print(f"\nEpochs: {epochs}")
-            print("Method        Target   Compression(x)        Accuracy(%)")
-            print("------------- ------- ---------------------- ----------------")
+            print(f'\nEpochs: {epochs}')
+            total_mean = entry['total_parameters_mean']
+            total_std = entry['total_parameters_std']
+            if total_std:
+                print(f'Total parameters (unpruned): {total_mean:.0f}±{total_std:.0f}')
+            else:
+                print(f'Total parameters (unpruned): {total_mean:.0f}')
+            print(
+                "Method        Target   Compression(x)        Alive Params        "
+                "Acc. After Prune (%)   Acc. After Retrain (%)"
+            )
+            print(
+                "------------- ------- ---------------------- ------------------- "
+                "---------------------- -----------------------"
+            )
+
+        acc_prune = entry['accuracy_after_pruning_mean']
+        acc_prune_std = entry['accuracy_after_pruning_std']
+        acc_retrain = entry['accuracy_after_retraining_mean']
+        acc_retrain_std = entry['accuracy_after_retraining_std']
+        alive_mean = entry['alive_parameters_mean']
+        alive_std = entry['alive_parameters_std']
 
         print(
-            f"{method:<13} {target:>7.3f} {comp:>10.2f}±{comp_std:<7.2f} {acc:>10.2f}±{acc_std:<6.2f}"
+            f"{method:<13} {target:>7.3f} {comp:>10.2f}±{comp_std:<7.2f} "
+            f"{alive_mean:>11.0f}±{alive_std:<6.0f} "
+            f"{acc_prune:>10.2f}±{acc_prune_std:<6.2f} {acc_retrain:>10.2f}±{acc_retrain_std:<6.2f}"
         )
-
 
 def main():
     args = parse_args()
