@@ -143,6 +143,34 @@ def create_plot(aggregates, model, output_dir):
         plt.close()
 
 
+def print_summary(aggregates):
+    if not aggregates:
+        print('No metrics collected; nothing to summarise.')
+        return
+
+    aggregates = sorted(aggregates, key=lambda item: (item['epochs'], item['pruning_method'], item['target_sparsity']))
+    current_epoch = None
+    print('\n===== Benchmark Summary =====')
+    for entry in aggregates:
+        epochs = entry['epochs']
+        method = entry['pruning_method']
+        target = entry['target_sparsity']
+        comp = entry['compression_ratio_mean']
+        comp_std = entry['compression_ratio_std']
+        acc = entry['accuracy_mean']
+        acc_std = entry['accuracy_std']
+
+        if epochs != current_epoch:
+            current_epoch = epochs
+            print(f"\nEpochs: {epochs}")
+            print("Method        Target   Compression(x)        Accuracy(%)")
+            print("------------- ------- ---------------------- ----------------")
+
+        print(
+            f"{method:<13} {target:>7.3f} {comp:>10.2f}±{comp_std:<7.2f} {acc:>10.2f}±{acc_std:<6.2f}"
+        )
+
+
 def main():
     args = parse_args()
     output_dir = ensure_output_dir(args.output_dir)
@@ -227,6 +255,7 @@ def main():
 
     aggregates = aggregate_results(records)
     create_plot(aggregates, args.model, output_dir)
+    print_summary(aggregates)
 
     print('Benchmark complete.')
     print(f'Raw metrics saved to: {raw_metrics_path}')
