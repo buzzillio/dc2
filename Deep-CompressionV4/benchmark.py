@@ -72,6 +72,10 @@ def parse_args():
                         help='path to pruning.py (auto-detected by default)')
     parser.add_argument('--keep-intermediate', action='store_true',
                         help='retain intermediate metrics files (for debugging)')
+    parser.add_argument(
+        '--pruning-args', nargs=argparse.REMAINDER, default=[],
+        help='Extra arguments appended to every pruning.py call; useful for NeuronRank tuning.'
+    )
     return parser.parse_args()
 
 
@@ -339,6 +343,8 @@ def main():
                 train_cmd.extend(['--weight-decay', str(args.weight_decay)])
             if need_neuronrank_stats:
                 train_cmd.extend(['--save-activation-stats', stats_path])
+            if args.pruning_args:
+                train_cmd.extend(args.pruning_args)
 
             print(f'Training seed={seed}, epochs={epochs}')
             run_pruning(args.pruning_script, train_cmd)
@@ -399,6 +405,8 @@ def main():
                         prune_cmd.extend(['--weight-decay', str(args.weight_decay)])
                     if method == 'neuronrank':
                         prune_cmd.extend(['--activation-stats', stats_path])
+                    if args.pruning_args:
+                        prune_cmd.extend(args.pruning_args)
 
                     print(f"Pruning seed={seed}, epochs={epochs}, target={target:.3f}, method={method}")
                     run_pruning(args.pruning_script, prune_cmd)
