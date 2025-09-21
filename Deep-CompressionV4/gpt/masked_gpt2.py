@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+# Suppress TensorFlow and CUDA warnings before transformers import
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+
 import types
 
 import torch

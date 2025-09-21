@@ -65,6 +65,9 @@ def run_pruning(pruning_script, args_list):
     """Run pruning.py with the provided argument list."""
     env = os.environ.copy()
     env.setdefault('MKL_THREADING_LAYER', 'GNU')
+    # Suppress TensorFlow and CUDA warnings
+    env.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    env.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
     completed = subprocess.run(
         [sys.executable, pruning_script, *args_list],
         check=True,
