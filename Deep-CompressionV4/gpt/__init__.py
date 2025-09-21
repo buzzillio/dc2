@@ -9,6 +9,7 @@ try:
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     _missing_dependency = exc.name or 'datasets'
+    _missing_exception = exc
 
     def _missing_wikitext2(*_args, **_kwargs):
         raise ModuleNotFoundError(
@@ -17,7 +18,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
             "'transformers' packages to enable GPT-2 workflows.".format(
                 dep=_missing_dependency
             )
-        ) from exc
+        ) from _missing_exception
 
     build_wikitext2_dataloaders = _missing_wikitext2
     load_wikitext2 = _missing_wikitext2
