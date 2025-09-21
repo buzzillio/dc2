@@ -189,6 +189,18 @@ def update_metrics_with_eval(target: Dict, values: Dict[str, float], prefix: str
     if "loss" in values:
         target[f"loss_{prefix}"] = values["loss"]
 
+
+def print_eval_snapshot(label: str, values: Dict[str, float]) -> None:
+    metric = values.get(evaluation_metric_key())
+    loss = values.get("loss")
+    pieces = [label]
+    if metric is not None:
+        pieces.append(f"{evaluation_metric_key()}={metric:.4f}")
+    if loss is not None:
+        pieces.append(f"loss={loss:.4f}")
+    if len(pieces) > 1:
+        print(" | ".join(pieces))
+
 def ensure_defaults(parsed_args) -> None:
     if parsed_args.model == 'lenet':
         defaults = {
@@ -598,6 +610,7 @@ def execute_training_phase(train_epochs: int, collect_stats: bool = False) -> Tu
     train_model(train_epochs, optimizer, mask_grad=False)
     eval_initial = evaluate_model()
     maybe_log_metric('initial', eval_initial)
+    print_eval_snapshot('Initial evaluation', eval_initial)
 
     if not args.skip_model_save and args.output_checkpoint:
         save_checkpoint(args.output_checkpoint, train_epochs)
@@ -683,6 +696,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
     sparsity_stats = util.collect_nonzero_stats(model)
     eval_after_pruning = evaluate_model()
     maybe_log_metric('after_pruning', eval_after_pruning)
+    print_eval_snapshot('After pruning', eval_after_pruning)
     print('--- After pruning ---')
     util.print_nonzeros(model)
 
@@ -697,6 +711,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
 
     eval_after_retraining = evaluate_model()
     maybe_log_metric('after_retraining', eval_after_retraining)
+    print_eval_snapshot('After retraining', eval_after_retraining)
     print('--- After Retraining ---')
     util.print_nonzeros(model)
 
@@ -710,6 +725,7 @@ def run_pruning_mode():
     load_model_for_pruning(args.checkpoint)
     eval_initial = evaluate_model()
     maybe_log_metric('initial', eval_initial)
+    print_eval_snapshot('Initial evaluation', eval_initial)
 
     activation_stats = None
     if args.pruning_method == 'neuronrank' and args.activation_stats:
