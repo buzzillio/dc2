@@ -435,7 +435,11 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
     for epoch in range(epochs):
         adjust_learning_rate(optimizer, epoch, base_lr)
         model.train()
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader))
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            dynamic_ncols=True,
+        )
         for batch_idx, batch in pbar:
             optimizer.zero_grad()
             if args.model in ('gpt2', 'nanogpt'):
@@ -479,7 +483,10 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
             # Log detailed info only at specified intervals 
             if batch_idx % args.log_interval == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f'Epoch {epoch}, Batch {batch_idx}: Loss = {loss.item():.6f}, LR = {current_lr:.2e}')
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.6f}',
+                    'lr': f'{current_lr:.2e}',
+                }, refresh=False)
 
 
 def evaluate_model() -> Dict[str, float]:
