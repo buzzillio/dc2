@@ -424,7 +424,9 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
                 current_batch_size = inputs['input_ids'].size(0)
                 done = batch_idx * args.batch_size + current_batch_size
             else:
-                done = batch_idx * len(data) + len(data)
+                # For non-GPT2 models, data is a tensor
+                current_batch_size = data.size(0)
+                done = batch_idx * args.batch_size + current_batch_size
             pct = 100.0 * (batch_idx + 1) / len(train_loader)
             pbar.set_description(
                 f'Train Epoch: {epoch} [{done:5}/{dataset_size} ({pct:3.0f}%)]  Loss: {loss.item():.6f}'
