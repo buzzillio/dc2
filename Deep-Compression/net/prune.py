@@ -273,6 +273,5 @@ class MaskedLinear(Module):
     def apply_new_mask(self, new_mask):
         new_mask = new_mask.to(self.mask.device, dtype=self.mask.dtype)
         self.mask.data = new_mask
-        self.weight.data = self.weight.data.to(self.weight.device) * new_mask.to(self.weight.device)
 
 

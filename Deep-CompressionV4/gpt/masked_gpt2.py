@@ -31,7 +31,6 @@ def _ensure_mask(module: nn.Module) -> None:
     def apply_new_mask(self: nn.Module, new_mask: torch.Tensor) -> None:
         new_mask = new_mask.to(self.mask.device, dtype=self.mask.dtype)
         self.mask.data.copy_(new_mask)
-        self.weight.data.mul_(self.mask.to(self.weight.device, dtype=self.weight.dtype))
 
     def prune(self: nn.Module, threshold: float) -> None:
         current_mask = self.mask.data
