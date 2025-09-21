@@ -47,14 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpt2-model-name', type=str, default='gpt2',
                         help='Hugging Face model identifier or local path when --model=gpt2')
     parser.add_argument('--gpt2-block-size', type=int, default=1024,
-                        help='Sequence length for GPT-2 language modelling (default: 1024)')
-    parser.add_argument('--gpt2-cache-dir', type=str, default=None,
-                        help='Optional cache directory for GPT-2 checkpoints and WikiText-2 data')
-    parser.add_argument('--gpt2-max-eval-batches', type=int, default=None,
-                        help='Limit evaluation batches for GPT-2 runs (handy for smoke tests)')
-    parser.add_argument('--gpt2-model-name', type=str, default='gpt2',
-                        help='Hugging Face model identifier or local path when --model=gpt2')
-    parser.add_argument('--gpt2-block-size', type=int, default=1024,
                         help='Sequence length for WikiText-2 when --model=gpt2 (default: 1024)')
     parser.add_argument('--gpt2-cache-dir', type=str, default=None,
                         help='Optional cache directory for GPT-2 checkpoints and WikiText-2 data')
