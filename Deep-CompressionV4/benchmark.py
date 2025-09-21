@@ -21,7 +21,7 @@ PRUNING_SCRIPT = os.path.join(PROJECT_ROOT, 'pruning.py')
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Benchmark std vs NeuronRank pruning.')
-    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2'], default='lenet',
+    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2', 'nanogpt'], default='lenet',
                         help='model to benchmark (default: lenet)')
     parser.add_argument('--vgg-arch', default='vgg19', choices=[
         'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn', 'vgg19', 'vgg19_bn'
@@ -34,6 +34,17 @@ def parse_args():
                         help='Optional cache directory for GPT-2 checkpoints and WikiText-2')
     parser.add_argument('--gpt2-max-eval-batches', type=int, default=None,
                         help='Limit evaluation batches for GPT-2 benchmarks (useful for smoke tests)')
+    parser.add_argument('--nanogpt-n-layer', type=int, default=6,
+                        help='number of transformer blocks when --model=nanogpt (default: 6)')
+    parser.add_argument('--nanogpt-n-head', type=int, default=6,
+                        help='number of attention heads when --model=nanogpt (default: 6)')
+    parser.add_argument('--nanogpt-n-embd', type=int, default=384,
+                        help='embedding dimension when --model=nanogpt (default: 384)')
+    parser.add_argument('--nanogpt-dropout', type=float, default=0.2,
+                        help='dropout rate when --model=nanogpt (default: 0.2)')
+    parser.add_argument('--nanogpt-no-bias', dest='nanogpt_bias', action='store_false',
+                        help='disable bias terms in NanoGPT layer norms and projections')
+    parser.set_defaults(nanogpt_bias=True)
     parser.add_argument('--device', default=None,
                         help='device argument forwarded to pruning.py (e.g., cuda, mps, cpu)')
     parser.add_argument('--epochs', type=int, nargs='*', default=None,
@@ -67,7 +78,7 @@ def parse_args():
 def default_milestones(model: str):
     if model == 'lenet':
         return [50, 100]
-    if model == 'gpt2':
+    if model in ('gpt2', 'nanogpt'):
         return [1, 2, 3]
     return [50, 100, 150, 200, 250, 300]
 
@@ -294,7 +305,7 @@ def main():
             ]
             if args.model == 'vgg':
                 train_cmd.extend(['--vgg-arch', args.vgg_arch])
-            elif args.model == 'gpt2':
+            elif args.model in ('gpt2', 'nanogpt'):
                 train_cmd.extend([
                     '--gpt2-model-name', args.gpt2_model_name,
                     '--gpt2-block-size', str(args.gpt2_block_size),
@@ -303,6 +314,15 @@ def main():
                     train_cmd.extend(['--gpt2-cache-dir', args.gpt2_cache_dir])
                 if args.gpt2_max_eval_batches is not None:
                     train_cmd.extend(['--gpt2-max-eval-batches', str(args.gpt2_max_eval_batches)])
+                if args.model == 'nanogpt':
+                    train_cmd.extend([
+                        '--nanogpt-n-layer', str(args.nanogpt_n_layer),
+                        '--nanogpt-n-head', str(args.nanogpt_n_head),
+                        '--nanogpt-n-embd', str(args.nanogpt_n_embd),
+                        '--nanogpt-dropout', str(args.nanogpt_dropout),
+                    ])
+                    if not args.nanogpt_bias:
+                        train_cmd.append('--nanogpt-no-bias')
             if args.device:
                 train_cmd.extend(['--device', args.device])
             if args.workers is not None:
@@ -345,7 +365,7 @@ def main():
                     ]
                     if args.model == 'vgg':
                         prune_cmd.extend(['--vgg-arch', args.vgg_arch])
-                    elif args.model == 'gpt2':
+                    elif args.model in ('gpt2', 'nanogpt'):
                         prune_cmd.extend([
                             '--gpt2-model-name', args.gpt2_model_name,
                             '--gpt2-block-size', str(args.gpt2_block_size),
@@ -354,6 +374,15 @@ def main():
                             prune_cmd.extend(['--gpt2-cache-dir', args.gpt2_cache_dir])
                         if args.gpt2_max_eval_batches is not None:
                             prune_cmd.extend(['--gpt2-max-eval-batches', str(args.gpt2_max_eval_batches)])
+                        if args.model == 'nanogpt':
+                            prune_cmd.extend([
+                                '--nanogpt-n-layer', str(args.nanogpt_n_layer),
+                                '--nanogpt-n-head', str(args.nanogpt_n_head),
+                                '--nanogpt-n-embd', str(args.nanogpt_n_embd),
+                                '--nanogpt-dropout', str(args.nanogpt_dropout),
+                            ])
+                            if not args.nanogpt_bias:
+                                prune_cmd.append('--nanogpt-no-bias')
                     if args.device:
                         prune_cmd.extend(['--device', args.device])
                     if args.workers is not None:

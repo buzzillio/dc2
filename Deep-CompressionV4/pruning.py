@@ -11,7 +11,12 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 
 from net.models import LeNet, build_cifar_vgg, SUPPORTED_VGG_ARCHS
-from gpt import MaskedGPT2LMHeadModel, build_wikitext2_dataloaders
+from gpt import (
+    MaskedGPT2LMHeadModel,
+    MaskedNanoGPT,
+    NanoGPTConfig,
+    build_wikitext2_dataloaders,
+)
 import util
 
 
@@ -25,6 +30,7 @@ criterion: Optional[nn.Module] = None
 eval_criterion: Optional[nn.Module] = None
 weight_masks = {}
 non_blocking = False
+tokenizer = None
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help='full: train + prune (default); train: only fit and save checkpoint; '
                              'prune: load checkpoint and prune/retrain')
 
-    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2'], default='lenet',
+    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2', 'nanogpt'], default='lenet',
                         help='model to use (default: lenet)')
     parser.add_argument('--vgg-arch', choices=SUPPORTED_VGG_ARCHS, default='vgg19',
                         help='VGG architecture when --model=vgg (default: vgg19)')
@@ -52,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Optional cache directory for GPT-2 checkpoints and WikiText-2 data')
     parser.add_argument('--gpt2-max-eval-batches', type=int, default=None,
                         help='Limit evaluation batches for GPT-2 runs (useful for smoke tests)')
+
+    parser.add_argument('--nanogpt-n-layer', type=int, default=6,
+                        help='number of transformer blocks when --model=nanogpt (default: 6)')
+    parser.add_argument('--nanogpt-n-head', type=int, default=6,
+                        help='number of attention heads when --model=nanogpt (default: 6)')
+    parser.add_argument('--nanogpt-n-embd', type=int, default=384,
+                        help='embedding dimension when --model=nanogpt (default: 384)')
+    parser.add_argument('--nanogpt-dropout', type=float, default=0.2,
+                        help='dropout rate when --model=nanogpt (default: 0.2)')
+    parser.add_argument('--nanogpt-no-bias', dest='nanogpt_bias', action='store_false',
+                        help='disable bias terms in NanoGPT layer norms and projections')
+    parser.set_defaults(nanogpt_bias=True)
 
     parser.add_argument('--device', choices=['cuda', 'mps', 'cpu'], default=None,
                         help='execution device (auto-detected when omitted)')
@@ -163,7 +181,7 @@ def maybe_log(message: str) -> None:
 def evaluation_metric_key() -> str:
     if args is None:
         return 'accuracy'
-    return 'perplexity' if args.model == 'gpt2' else 'accuracy'
+    return 'perplexity' if args.model in ('gpt2', 'nanogpt') else 'accuracy'
 
 
 def maybe_log_metric(prefix: str, metrics: Dict[str, float]) -> None:
@@ -214,7 +232,7 @@ def ensure_defaults(parsed_args) -> None:
             'weight_decay': 5e-4,
             'workers': 4,
         }
-    else:  # GPT-2 + WikiText-2
+    elif parsed_args.model in ('gpt2', 'nanogpt'):  # Language models + WikiText-2
         defaults = {
             'batch_size': 4,
             'test_batch_size': 4,
@@ -224,13 +242,15 @@ def ensure_defaults(parsed_args) -> None:
             'weight_decay': 0.01,
             'workers': 2,
         }
+    else:
+        raise ValueError(f'Unsupported model: {parsed_args.model}')
     for key, value in defaults.items():
         if getattr(parsed_args, key) is None:
             setattr(parsed_args, key, value)
 
 
 def prepare_environment(parsed_args) -> None:
-    global device, train_loader, test_loader, non_blocking
+    global device, train_loader, test_loader, non_blocking, tokenizer
 
     if parsed_args.device == 'cuda':
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -255,8 +275,8 @@ def prepare_environment(parsed_args) -> None:
     non_blocking = device.type != 'cpu'
     workers = parsed_args.workers or (4 if device.type != 'cpu' else 0)
 
-    if parsed_args.model == 'gpt2':
-        train_loader_local, test_loader_local, _ = build_wikitext2_dataloaders(
+    if parsed_args.model in ('gpt2', 'nanogpt'):
+        train_loader_local, test_loader_local, tok = build_wikitext2_dataloaders(
             tokenizer_name=parsed_args.gpt2_model_name,
             cache_dir=parsed_args.gpt2_cache_dir,
             block_size=parsed_args.gpt2_block_size,
@@ -266,6 +286,7 @@ def prepare_environment(parsed_args) -> None:
             pin_memory=pin_memory,
             shuffle=True,
         )
+        tokenizer = tok
         return train_loader_local, test_loader_local
 
     transform_train, transform_test = None, None
@@ -316,6 +337,27 @@ def instantiate_model(parsed_args) -> Tuple[nn.Module, nn.Module, nn.Module]:
             parsed_args.gpt2_model_name,
             cache_dir=parsed_args.gpt2_cache_dir,
         ).to(device)
+        crit = None
+        eval_crit = None
+    elif parsed_args.model == 'nanogpt':
+        if tokenizer is None:
+            raise RuntimeError('Tokenizer not initialised; call prepare_environment before instantiating NanoGPT')
+        vocab_size = getattr(tokenizer, 'vocab_size', None)
+        if not vocab_size:
+            vocab_size = len(tokenizer)
+        try:
+            config = NanoGPTConfig(
+                vocab_size=int(vocab_size),
+                block_size=parsed_args.gpt2_block_size,
+                n_layer=parsed_args.nanogpt_n_layer,
+                n_head=parsed_args.nanogpt_n_head,
+                n_embd=parsed_args.nanogpt_n_embd,
+                dropout=parsed_args.nanogpt_dropout,
+                bias=parsed_args.nanogpt_bias,
+            )
+        except ValueError as exc:
+            raise ValueError(f'Invalid NanoGPT configuration: {exc}') from exc
+        mdl = MaskedNanoGPT(config).to(device)
         crit = None
         eval_crit = None
     else:
@@ -374,7 +416,7 @@ def build_weight_mask_map(mdl: nn.Module) -> Dict[str, torch.Tensor]:
 def create_optimizer():
     if args.model == 'vgg':
         return optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    if args.model == 'gpt2':
+    if args.model in ('gpt2', 'nanogpt'):
         return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     return optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -396,10 +438,12 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
         pbar = tqdm(enumerate(train_loader), total=len(train_loader))
         for batch_idx, batch in pbar:
             optimizer.zero_grad()
-            if args.model == 'gpt2':
+            if args.model in ('gpt2', 'nanogpt'):
                 inputs = {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
                 outputs = model(**inputs)
                 loss = outputs.loss
+                if loss is None:
+                    raise RuntimeError('Language model forward pass did not return a loss value')
             else:
                 data, target = batch
                 data = data.to(device, non_blocking=non_blocking)
@@ -419,7 +463,7 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
             optimizer.step()
             
             # Update progress bar description every batch for better visibility
-            if args.model == 'gpt2':
+            if args.model in ('gpt2', 'nanogpt'):
                 # Calculate actual samples processed (handle variable batch sizes correctly)
                 current_batch_size = inputs['input_ids'].size(0)
                 done = batch_idx * args.batch_size + current_batch_size
@@ -440,7 +484,7 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
 
 def evaluate_model() -> Dict[str, float]:
     model.eval()
-    if args.model == 'gpt2':
+    if args.model in ('gpt2', 'nanogpt'):
         total_loss = 0.0
         total_tokens = 0
         examples = 0
@@ -449,7 +493,13 @@ def evaluate_model() -> Dict[str, float]:
                 inputs = {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
                 outputs = model(**inputs)
                 loss = outputs.loss
-                token_count = inputs['input_ids'].numel()
+                if loss is None:
+                    raise RuntimeError('Language model forward pass did not return a loss value')
+                attention = inputs.get('attention_mask')
+                if attention is not None:
+                    token_count = int(attention.sum().item())
+                else:
+                    token_count = inputs['input_ids'].numel()
                 total_loss += loss.item() * token_count
                 total_tokens += token_count
                 examples += inputs['input_ids'].size(0)
@@ -482,7 +532,7 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     handles = []
 
-    is_gpt2 = args.model == 'gpt2'
+    is_language_model = args.model in ('gpt2', 'nanogpt')
 
     for name, module in mdl.named_modules():
         if not hasattr(module, 'mask'):
@@ -496,7 +546,7 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
                 if features is None:
                     return
                 features = features.detach()
-                if is_gpt2 and features.dim() >= 3:
+                if is_language_model and features.dim() >= 3:
                     flattened = features.abs().mean(dim=1)
                 elif features.dim() > 2:
                     reduce_dims = tuple(range(2, features.dim()))
@@ -532,7 +582,7 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
         for batch_idx, batch in enumerate(data_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            if is_gpt2:
+            if is_language_model:
                 inputs = {
                     key: value.to(device, non_blocking=non_blocking)
                     for key, value in batch.items()
