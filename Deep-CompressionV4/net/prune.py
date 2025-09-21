@@ -133,8 +133,18 @@ class PruningModule(Module):
                 tf_component = tf_component.reshape(view_shape)
                 idf_component = idf_component.reshape(view_shape)
             else:
-                tf_component = tf_component.reshape(1, -1)
-                idf_component = idf_component.reshape(1, -1)
+                feature_len = tf_component.numel()
+                if feature_len == weight.size(1):
+                    tf_component = tf_component.reshape(1, -1)
+                    idf_component = idf_component.reshape(1, -1)
+                elif feature_len == weight.size(0):
+                    tf_component = tf_component.reshape(-1, 1)
+                    idf_component = idf_component.reshape(-1, 1)
+                else:
+                    raise RuntimeError(
+                        f'Mismatch between activation stats (len={feature_len}) and weight shape '
+                        f'{tuple(weight.shape)} for layer {name}'
+                    )
 
             scores = weight_component * tf_component * idf_component
             scores = scores * mask
@@ -274,5 +284,4 @@ class MaskedLinear(Module):
         new_mask = new_mask.to(self.mask.device, dtype=self.mask.dtype)
         self.mask.data = new_mask
         self.weight.data = self.weight.data.to(self.weight.device) * new_mask.to(self.weight.device)
-
 
