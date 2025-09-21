@@ -187,8 +187,8 @@ def train(args: argparse.Namespace) -> None:
             model.train()
             inputs = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**inputs)
-            loss_value = outputs.loss.detach().item()
             loss = outputs.loss / args.gradient_accumulation_steps
+            loss_value = loss.detach().item()
             loss.backward()
 
             should_step = ((step + 1) % args.gradient_accumulation_steps == 0) or (step + 1 == len(train_loader))
