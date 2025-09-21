@@ -282,5 +282,6 @@ class MaskedLinear(Module):
 
     def apply_new_mask(self, new_mask):
         new_mask = new_mask.to(self.mask.device, dtype=self.mask.dtype)
-        self.mask.data = new_mask
+        self.mask.data.copy_(new_mask)
+        self.weight.data.mul_(self.mask.data)
 
