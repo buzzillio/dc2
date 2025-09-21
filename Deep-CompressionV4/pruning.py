@@ -417,15 +417,25 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
                         param.grad.mul_(mask)
 
             optimizer.step()
+            
+            # Update progress bar description every batch for better visibility
+            if args.model == 'gpt2':
+                # Calculate actual samples processed (handle variable batch sizes correctly)
+                current_batch_size = inputs['input_ids'].size(0)
+                done = batch_idx * args.batch_size + current_batch_size
+            else:
+                # For non-GPT2 models, data is a tensor
+                current_batch_size = data.size(0)
+                done = batch_idx * args.batch_size + current_batch_size
+            pct = 100.0 * (batch_idx + 1) / len(train_loader)
+            pbar.set_description(
+                f'Train Epoch: {epoch} [{done:5}/{dataset_size} ({pct:3.0f}%)]  Loss: {loss.item():.6f}'
+            )
+            
+            # Log detailed info only at specified intervals 
             if batch_idx % args.log_interval == 0:
-                if args.model == 'gpt2':
-                    done = (batch_idx + 1) * args.batch_size
-                else:
-                    done = batch_idx * len(data)
-                pct = 100.0 * batch_idx / len(train_loader)
-                pbar.set_description(
-                    f'Train Epoch: {epoch} [{done:5}/{dataset_size} ({pct:3.0f}%)]  Loss: {loss.item():.6f}'
-                )
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f'Epoch {epoch}, Batch {batch_idx}: Loss = {loss.item():.6f}, LR = {current_lr:.2e}')
 
 
 def evaluate_model() -> Dict[str, float]:
