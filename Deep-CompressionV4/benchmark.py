@@ -21,11 +21,13 @@ PRUNING_SCRIPT = os.path.join(PROJECT_ROOT, 'pruning.py')
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Benchmark std vs NeuronRank pruning.')
-    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2', 'nanogpt'], default='lenet',
+    parser.add_argument('--model', choices=['lenet', 'vgg', 'squeezenet', 'gpt2', 'nanogpt'], default='lenet',
                         help='model to benchmark (default: lenet)')
     parser.add_argument('--vgg-arch', default='vgg19', choices=[
         'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn', 'vgg19', 'vgg19_bn'
     ], help='VGG architecture when benchmarking VGG (default: vgg19)')
+    parser.add_argument('--squeezenet-version', default='1.1', choices=['1.1'],
+                        help='SqueezeNet version when benchmarking (default: 1.1)')
     parser.add_argument('--gpt2-model-name', default='gpt2',
                         help='Hugging Face model identifier or local path when benchmarking GPT-2')
     parser.add_argument('--gpt2-block-size', type=int, default=1024,
@@ -85,6 +87,8 @@ def parse_args():
 
 def default_milestones(model: str):
     if model == 'lenet':
+        return [50, 100]
+    if model == 'squeezenet':
         return [50, 100]
     if model in ('gpt2', 'nanogpt'):
         return [1, 2, 3]
@@ -317,6 +321,8 @@ def main():
             ]
             if args.model == 'vgg':
                 train_cmd.extend(['--vgg-arch', args.vgg_arch])
+            elif args.model == 'squeezenet':
+                train_cmd.extend(['--squeezenet-version', args.squeezenet_version])
             elif args.model in ('gpt2', 'nanogpt'):
                 train_cmd.extend([
                     '--gpt2-model-name', args.gpt2_model_name,
@@ -380,6 +386,8 @@ def main():
                     ]
                     if args.model == 'vgg':
                         prune_cmd.extend(['--vgg-arch', args.vgg_arch])
+                    elif args.model == 'squeezenet':
+                        prune_cmd.extend(['--squeezenet-version', args.squeezenet_version])
                     elif args.model in ('gpt2', 'nanogpt'):
                         prune_cmd.extend([
                             '--gpt2-model-name', args.gpt2_model_name,

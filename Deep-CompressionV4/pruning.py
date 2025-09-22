@@ -12,7 +12,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from net.models import LeNet, build_cifar_vgg, SUPPORTED_VGG_ARCHS
+from net.models import LeNet, build_cifar_vgg, build_cifar_squeezenet, SUPPORTED_VGG_ARCHS
 from gpt import (
     MaskedGPT2LMHeadModel,
     MaskedNanoGPT,
@@ -48,10 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help='full: train + prune (default); train: only fit and save checkpoint; '
                              'prune: load checkpoint and prune/retrain')
 
-    parser.add_argument('--model', choices=['lenet', 'vgg', 'gpt2', 'nanogpt'], default='lenet',
+    parser.add_argument('--model', choices=['lenet', 'vgg', 'squeezenet', 'gpt2', 'nanogpt'], default='lenet',
                         help='model to use (default: lenet)')
     parser.add_argument('--vgg-arch', choices=SUPPORTED_VGG_ARCHS, default='vgg19',
                         help='VGG architecture when --model=vgg (default: vgg19)')
+    parser.add_argument('--squeezenet-version', choices=['1.1'], default='1.1',
+                        help='SqueezeNet version when --model=squeezenet (default: 1.1)')
     parser.add_argument('--gpt2-model-name', type=str, default='gpt2',
                         help='Hugging Face model identifier or local path when --model=gpt2')
     parser.add_argument('--gpt2-block-size', type=int, default=1024,
@@ -224,7 +226,7 @@ def ensure_defaults(parsed_args) -> None:
             'weight_decay': 0.0001,
             'workers': 2,
         }
-    elif parsed_args.model == 'vgg':  # VGG + CIFAR-10
+    elif parsed_args.model in ('vgg', 'squeezenet'):  # CIFAR-10 convolutional models
         defaults = {
             'batch_size': 128,
             'test_batch_size': 128,
@@ -300,7 +302,7 @@ def prepare_environment(parsed_args) -> None:
         return train_loader_local, test_loader_local
 
     transform_train, transform_test = None, None
-    if parsed_args.model == 'vgg':
+    if parsed_args.model in ('vgg', 'squeezenet'):
         transform_train = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(32, padding=4),
@@ -340,6 +342,14 @@ def prepare_environment(parsed_args) -> None:
 def instantiate_model(parsed_args) -> Tuple[nn.Module, nn.Module, nn.Module]:
     if parsed_args.model == 'vgg':
         mdl = build_cifar_vgg(parsed_args.vgg_arch, mask=True, num_classes=10).to(device)
+        crit = nn.CrossEntropyLoss().to(device)
+        eval_crit = nn.CrossEntropyLoss(reduction='sum').to(device)
+    elif parsed_args.model == 'squeezenet':
+        mdl = build_cifar_squeezenet(
+            parsed_args.squeezenet_version,
+            mask=True,
+            num_classes=10,
+        ).to(device)
         crit = nn.CrossEntropyLoss().to(device)
         eval_crit = nn.CrossEntropyLoss(reduction='sum').to(device)
     elif parsed_args.model == 'gpt2':
@@ -384,6 +394,7 @@ def save_checkpoint(path: Optional[str], train_epochs: int) -> None:
     payload = {
         'model': args.model,
         'vgg_arch': args.vgg_arch if args.model == 'vgg' else None,
+        'squeezenet_version': args.squeezenet_version if args.model == 'squeezenet' else None,
         'state_dict': model.state_dict(),
         'metadata': {
             'train_epochs': train_epochs,
@@ -408,6 +419,8 @@ def load_checkpoint(path: str) -> Dict:
         args.model = checkpoint['model']
     if checkpoint.get('vgg_arch'):
         args.vgg_arch = checkpoint['vgg_arch']
+    if checkpoint.get('squeezenet_version'):
+        args.squeezenet_version = checkpoint['squeezenet_version']
     return checkpoint
 
 
@@ -424,7 +437,7 @@ def build_weight_mask_map(mdl: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def create_optimizer():
-    if args.model == 'vgg':
+    if args.model in ('vgg', 'squeezenet'):
         return optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     if args.model in ('gpt2', 'nanogpt'):
         return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -432,7 +445,7 @@ def create_optimizer():
 
 
 def adjust_learning_rate(optimizer, epoch, base_lr):
-    if args.model != 'vgg':
+    if args.model not in ('vgg', 'squeezenet'):
         return
     lr = base_lr * (0.5 ** (epoch // 30))
     for param_group in optimizer.param_groups:

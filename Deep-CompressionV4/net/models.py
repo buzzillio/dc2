@@ -173,3 +173,106 @@ def build_cifar_vgg(arch='vgg19', mask=False, num_classes=10, init_weights=True)
 
     features = _make_vgg_layers(_VGG_CONFIGS[cfg_key], batch_norm=batch_norm, mask=mask)
     return CifarVGG(features, num_classes=num_classes, init_weights=init_weights, mask=mask)
+
+
+class Fire(nn.Module):
+    """SqueezeNet Fire module with optional pruning masks."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        squeeze_channels: int,
+        expand1x1_channels: int,
+        expand3x3_channels: int,
+        *,
+        mask: bool = False,
+    ) -> None:
+        super().__init__()
+        conv_cls = MaskedConv2d if mask else nn.Conv2d
+
+        self.squeeze = conv_cls(in_channels, squeeze_channels, kernel_size=1)
+        self.squeeze_activation = nn.ReLU(inplace=True)
+
+        self.expand1x1 = conv_cls(squeeze_channels, expand1x1_channels, kernel_size=1)
+        self.expand1x1_activation = nn.ReLU(inplace=True)
+
+        self.expand3x3 = conv_cls(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
+        self.expand3x3_activation = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.squeeze_activation(self.squeeze(x))
+        return torch.cat([
+            self.expand1x1_activation(self.expand1x1(x)),
+            self.expand3x3_activation(self.expand3x3(x)),
+        ], dim=1)
+
+
+class MaskedSqueezeNet(PruningModule):
+    """Masked SqueezeNet backbone tuned for CIFAR-10."""
+
+    def __init__(self, num_classes: int = 10, *, mask: bool = False, init_weights: bool = True) -> None:
+        super().__init__()
+        conv_cls = MaskedConv2d if mask else nn.Conv2d
+
+        self.features = nn.Sequential(
+            conv_cls(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True),
+            Fire(64, 16, 64, 64, mask=mask),
+            Fire(128, 16, 64, 64, mask=mask),
+            nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True),
+            Fire(128, 32, 128, 128, mask=mask),
+            Fire(256, 32, 128, 128, mask=mask),
+            nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True),
+            Fire(256, 48, 192, 192, mask=mask),
+            Fire(384, 48, 192, 192, mask=mask),
+            Fire(384, 64, 256, 256, mask=mask),
+            Fire(512, 64, 256, 256, mask=mask),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.5),
+            conv_cls(512, num_classes, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+
+        if init_weights:
+            self._initialize_weights()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.classifier(x)
+        return torch.flatten(x, 1)
+
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (nn.Conv2d, MaskedConv2d)):
+                if module is self.classifier[1]:
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                else:
+                    nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+
+def build_cifar_squeezenet(version: str = '1.1', *, mask: bool = False, num_classes: int = 10, init_weights: bool = True) -> MaskedSqueezeNet:
+    """Instantiate a masked SqueezeNet variant configured for CIFAR-10."""
+
+    if version != '1.1':
+        raise ValueError(f"Unsupported SqueezeNet version '{version}'. Only '1.1' is available.")
+
+    return MaskedSqueezeNet(num_classes=num_classes, mask=mask, init_weights=init_weights)
+
+
+__all__ = [
+    'LeNet',
+    'LeNet_5',
+    'MaskedConv2d',
+    'MaskedSqueezeNet',
+    'Fire',
+    'SUPPORTED_VGG_ARCHS',
+    'CifarVGG',
+    'build_cifar_vgg',
+    'build_cifar_squeezenet',
+]
