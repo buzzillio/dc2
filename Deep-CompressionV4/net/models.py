@@ -251,7 +251,9 @@ class MaskedSqueezeNet(PruningModule):
                 if module is self.classifier[1]:
                     nn.init.normal_(module.weight, mean=0.0, std=0.01)
                 else:
-                    nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                    nn.init.kaiming_uniform_(
+                        module.weight, mode='fan_out', nonlinearity='relu'
+                    )
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
 
