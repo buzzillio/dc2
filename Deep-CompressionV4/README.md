@@ -80,6 +80,30 @@ Outputs are written to `benchmark_outputs/` (configurable via `--output-dir`) an
 include a JSONL file with raw metrics, a CSV export, and PNG plots showing
 accuracy vs. compression for each epoch milestone.
 
+### SqueezeNet + CIFAR-10
+
+SqueezeNet plugs into the same CIFAR-10 pipeline as VGG. Install the dependencies listed
+above (or via pip):
+
+```bash
+pip install torch torchvision tqdm numpy matplotlib
+```
+
+Run a one-shot prune using the baked-in CIFAR-10 defaults (SGD + momentum, augmentation, etc.):
+
+```bash
+python pruning.py --model squeezenet --mode full --epochs 100 --target-sparsity 0.9
+```
+
+To sweep sparsities and seeds automatically:
+
+```bash
+python benchmark.py --model squeezenet --epochs 50 100 --device cuda
+```
+
+The benchmark helper forwards additional arguments (e.g. `--pruning-args`) to `pruning.py` so you
+can reuse NeuronRank tuning without rewriting commands.
+
 ### GPT-2 + NeuronRank on WikiText-2
 
 Phase 1-3 add a full GPT-2 pipeline: fine-tuning, pruning, and benchmarking.
