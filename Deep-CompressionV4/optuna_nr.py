@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import random
 import shlex
 import shutil
 import statistics
@@ -14,9 +15,13 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Union
 
+import numpy as np
 import optuna
+import torch
+
+
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BENCHMARK_SCRIPT = os.path.join(PROJECT_ROOT, "benchmark.py")
@@ -34,12 +39,38 @@ class RunnerArgs:
     epochs: int
     sparsity: float
     lr: float | None
+    retrain_epochs: int | None
     seeds: Sequence[int]
     benchmark_path: str
     benchmark_extra_args: Sequence[str]
     work_dir: str | None
     keep_output: bool
     device: str | None
+
+
+@dataclass
+class SeedResult:
+    """Per-seed evaluation metrics returned by a benchmark run."""
+
+    seed: int
+    perplexity_after_pruning: float | None
+    perplexity_after_retraining: float
+
+
+def configure_reproducibility(seed: int) -> None:
+    """Initialise Python, NumPy, and PyTorch RNGs for deterministic behaviour."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(False)
+    except (AttributeError, TypeError, RuntimeError):
+        # Older PyTorch releases may not expose this helper; ignore when absent.
+        pass
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -71,6 +102,12 @@ def parse_cli_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional learning rate override forwarded to benchmark.py.",
+    )
+    parser.add_argument(
+        "--retrain-epochs",
+        type=int,
+        default=None,
+        help="Optional retraining epoch override forwarded to benchmark.py.",
     )
     parser.add_argument(
         "--seeds",
@@ -117,8 +154,8 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--pruner-startup-trials",
         type=int,
-        default=5,
-        help="Number of warm-up trials before MedianPruner activates (default: 5).",
+        default=8,
+        help="Number of warm-up trials before the median pruner activates (default: 8).",
     )
     parser.add_argument(
         "--benchmark-path",
@@ -158,6 +195,8 @@ def parse_cli_args() -> argparse.Namespace:
         parser.error("--sparcity/--sparsity must be in the range (0, 1].")
     if len(args.seeds) < 2:
         parser.error("At least two seeds are required to compute a median evaluation.")
+    if args.retrain_epochs is not None and args.retrain_epochs <= 0:
+        parser.error("--retrain-epochs must be positive when provided.")
 
     args.benchmark_path = os.path.abspath(args.benchmark_path)
 
@@ -204,16 +243,19 @@ def parse_summary_perplexity(output: str, target_sparsity: float) -> float:
     )
 
 
-def load_perplexity_from_metrics(
+def load_perplexity_metrics(
     output_dir: str, target_sparsity: float, seed: int
-) -> List[float]:
-    """Load per-seed perplexity measurements from raw_metrics.jsonl."""
+) -> Dict[str, float | None]:
+    """Return perplexity metrics for the requested seed from raw_metrics.jsonl."""
 
     metrics_path = os.path.join(output_dir, "raw_metrics.jsonl")
+    result: Dict[str, float | None] = {
+        "perplexity_after_pruning": None,
+        "perplexity_after_retraining": None,
+    }
     if not os.path.exists(metrics_path):
-        return []
+        return result
 
-    values: List[float] = []
     with open(metrics_path, "r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -229,19 +271,19 @@ def load_perplexity_from_metrics(
                 continue
             if record.get("seed") != seed:
                 continue
-            metric = record.get("perplexity_after_retraining")
-            if metric is None:
-                metric = record.get("perplexity_after_pruning")
-            if metric is None:
-                continue
-            values.append(float(metric))
-    return values
+            prune_metric = record.get("perplexity_after_pruning")
+            retrain_metric = record.get("perplexity_after_retraining")
+            if prune_metric is not None:
+                result["perplexity_after_pruning"] = float(prune_metric)
+            if retrain_metric is not None:
+                result["perplexity_after_retraining"] = float(retrain_metric)
+    return result
 
 
 def build_benchmark_command(
     runner_args: RunnerArgs,
     seed: int,
-    params: Dict[str, float],
+    params: Dict[str, Union[float, int]],
     output_dir: str,
 ) -> List[str]:
     """Construct the benchmark.py command for a single seed evaluation."""
@@ -265,8 +307,14 @@ def build_benchmark_command(
         output_dir,
     ]
 
-    if runner_args.lr is not None:
-        cmd.extend(["--lr", str(runner_args.lr)])
+    lr_value = params.get("lr") if "lr" in params else runner_args.lr
+    if lr_value is not None:
+        cmd.extend(["--lr", f"{float(lr_value):.6e}"])
+    retrain_epochs_value = (
+        params.get("retrain_epochs") if "retrain_epochs" in params else runner_args.retrain_epochs
+    )
+    if retrain_epochs_value is not None:
+        cmd.extend(["--retrain-epochs-override", str(int(retrain_epochs_value))])
     if runner_args.device:
         cmd.extend(["--device", runner_args.device])
     if runner_args.benchmark_extra_args:
@@ -291,21 +339,33 @@ def build_benchmark_command(
 def run_single_seed(
     runner_args: RunnerArgs,
     seed: int,
-    params: Dict[str, float],
-) -> float:
-    """Execute benchmark.py for a single seed and return the perplexity value."""
+    params: Dict[str, Union[float, int]],
+    trial_number: int,
+) -> SeedResult:
+    """Execute benchmark.py for a single seed and return collected metrics."""
 
-    tmp_dir = tempfile.mkdtemp(prefix=f"optuna_seed_{seed}_", dir=runner_args.work_dir)
+    prefix = f"trial_{trial_number:04d}_seed_{seed}_"
+    tmp_dir = tempfile.mkdtemp(prefix=prefix, dir=runner_args.work_dir)
     command = build_benchmark_command(runner_args, seed, params, tmp_dir)
     print(f"Running benchmark for seed {seed}: {' '.join(shlex.quote(part) for part in command)}")
     try:
+        env = os.environ.copy()
+        env.setdefault("PYTHONHASHSEED", str(seed))
         completed = subprocess.run(
             command,
             check=False,
             capture_output=True,
             text=True,
             cwd=PROJECT_ROOT,
+            env=env,
         )
+        stdout_path = os.path.join(tmp_dir, "benchmark_stdout.txt")
+        stderr_path = os.path.join(tmp_dir, "benchmark_stderr.txt")
+        with open(stdout_path, "w", encoding="utf-8") as stdout_file:
+            stdout_file.write(completed.stdout)
+        with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+            stderr_file.write(completed.stderr)
+
         if completed.returncode != 0:
             print(completed.stdout, file=sys.stdout)
             print(completed.stderr, file=sys.stderr)
@@ -314,13 +374,33 @@ def run_single_seed(
             )
 
         summary_ppl = parse_summary_perplexity(completed.stdout, runner_args.sparsity)
-        raw_values = load_perplexity_from_metrics(tmp_dir, runner_args.sparsity, seed)
-        if raw_values:
-            ppl_value = raw_values[-1]
-        else:
-            ppl_value = summary_ppl
-        print(f"Seed {seed} perplexity after retraining: {ppl_value:.4f}")
-        return ppl_value
+        metrics = load_perplexity_metrics(tmp_dir, runner_args.sparsity, seed)
+        prune_value = metrics["perplexity_after_pruning"]
+        retrain_value = metrics["perplexity_after_retraining"] or summary_ppl
+
+        result_path = os.path.join(tmp_dir, "metrics_summary.json")
+        with open(result_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "seed": seed,
+                    "command": command,
+                    "summary_perplexity": summary_ppl,
+                    "perplexity_after_pruning": prune_value,
+                    "perplexity_after_retraining": retrain_value,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+
+        if prune_value is not None:
+            print(f"Seed {seed} perplexity after pruning: {prune_value:.4f}")
+        print(f"Seed {seed} perplexity after retraining: {retrain_value:.4f}")
+        return SeedResult(
+            seed=seed,
+            perplexity_after_pruning=prune_value,
+            perplexity_after_retraining=retrain_value,
+        )
     finally:
         if runner_args.keep_output:
             print(f"Benchmark artefacts preserved at {tmp_dir}")
@@ -329,10 +409,14 @@ def run_single_seed(
 
 
 def create_study(args: argparse.Namespace) -> optuna.Study:
-    sampler = optuna.samplers.TPESampler(seed=args.sampler_seed)
+    sampler = optuna.samplers.TPESampler(
+        seed=args.sampler_seed,
+        multivariate=True,
+        group=True,
+    )
     pruner = optuna.pruners.MedianPruner(
         n_startup_trials=args.pruner_startup_trials,
-        n_warmup_steps=0,
+        n_warmup_steps=1,
         interval_steps=1,
     )
     return optuna.create_study(
@@ -348,10 +432,15 @@ def create_study(args: argparse.Namespace) -> optuna.Study:
 def main() -> None:
     args = parse_cli_args()
 
+    if args.work_dir:
+        args.work_dir = os.path.abspath(args.work_dir)
+        os.makedirs(args.work_dir, exist_ok=True)
+
     runner_args = RunnerArgs(
         epochs=args.epochs,
         sparsity=args.sparsity,
         lr=args.lr,
+        retrain_epochs=args.retrain_epochs,
         seeds=tuple(args.seeds),
         benchmark_path=args.benchmark_path,
         benchmark_extra_args=tuple(args.benchmark_extra_args),
@@ -360,31 +449,72 @@ def main() -> None:
         device=args.device,
     )
 
+    configure_reproducibility(args.sampler_seed)
     study = create_study(args)
 
     def objective(trial: optuna.Trial) -> float:
-        params = {
-            "neuronrank_max_batches": trial.suggest_int("neuronrank_max_batches", 800, 1600, step=100),
-            "neuronrank_idf_add": trial.suggest_float("neuronrank_idf_add", 0.4, 1.0),
-            "neuronrank_idf_smooth": trial.suggest_float("neuronrank_idf_smooth", 0.4, 1.0),
-            "neuronrank_tf_power": trial.suggest_float("neuronrank_tf_power", 0.90, 1.05),
-            "neuronrank_idf_power": trial.suggest_float("neuronrank_idf_power", 1.03, 1.10),
+        configure_reproducibility(args.sampler_seed + trial.number)
+
+        params: Dict[str, Union[float, int]] = {
+            "neuronrank_max_batches": trial.suggest_int(
+                "neuronrank_max_batches", 800, 1500, step=100
+            ),
+            "neuronrank_idf_add": trial.suggest_float("neuronrank_idf_add", 0.6, 1.0),
+            "neuronrank_idf_smooth": trial.suggest_float("neuronrank_idf_smooth", 0.6, 1.0),
+            "neuronrank_tf_power": trial.suggest_float("neuronrank_tf_power", 0.95, 1.05),
+            "neuronrank_idf_power": trial.suggest_float("neuronrank_idf_power", 1.05, 1.10),
         }
+        if runner_args.lr is None:
+            params["lr"] = trial.suggest_float("lr", 1.2e-4, 1.6e-4, log=True)
+        else:
+            params["lr"] = runner_args.lr
+            trial.set_user_attr("fixed_lr", runner_args.lr)
+
+        if runner_args.retrain_epochs is None:
+            if runner_args.sparsity >= 0.9:
+                retrain_low, retrain_high = 12, 16
+            else:
+                retrain_low, retrain_high = 8, 12
+            params["retrain_epochs"] = trial.suggest_int(
+                "retrain_epochs", retrain_low, retrain_high
+            )
+        else:
+            params["retrain_epochs"] = runner_args.retrain_epochs
+            trial.set_user_attr("fixed_retrain_epochs", runner_args.retrain_epochs)
+
         print(f"Trial {trial.number} parameters: {params}")
 
-        per_seed_values: List[float] = []
+        per_seed_results: List[SeedResult] = []
         for step, seed in enumerate(runner_args.seeds):
-            ppl_value = run_single_seed(runner_args, seed, params)
-            per_seed_values.append(ppl_value)
-            trial.report(ppl_value, step=step)
+            result = run_single_seed(runner_args, seed, params, trial.number)
+            per_seed_results.append(result)
+
+            prune_step = step * 2
+            if result.perplexity_after_pruning is not None:
+                trial.report(result.perplexity_after_pruning, step=prune_step)
+                if trial.should_prune():
+                    print(
+                        f"Pruning trial {trial.number} at seed index {step} (post-prune metric)"
+                    )
+                    raise optuna.TrialPruned()
+
+            retrain_step = prune_step + 1
+            trial.report(result.perplexity_after_retraining, step=retrain_step)
             if trial.should_prune():
-                print(f"Pruning trial {trial.number} at seed index {step}")
+                print(
+                    f"Pruning trial {trial.number} at seed index {step} (post-retrain metric)"
+                )
                 raise optuna.TrialPruned()
 
-        median_value = statistics.median(per_seed_values)
+        retrain_values = [res.perplexity_after_retraining for res in per_seed_results]
+        median_value = statistics.median(retrain_values)
         trial.set_user_attr(
             "per_seed_perplexity",
-            {str(seed): value for seed, value in zip(runner_args.seeds, per_seed_values)},
+            {str(res.seed): res.perplexity_after_retraining for res in per_seed_results},
+        )
+        trial.set_user_attr(
+            "per_seed_prune_perplexity",
+            {str(res.seed): res.perplexity_after_pruning for res in per_seed_results},
         )
         print(
             f"Trial {trial.number} median perplexity across seeds: {median_value:.4f}"

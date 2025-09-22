@@ -2,8 +2,10 @@ import argparse
 import json
 import math
 import os
+import random
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -267,9 +269,17 @@ def prepare_environment(parsed_args) -> None:
             device = torch.device('cpu')
 
     print(f'Using device: {device}')
+    random.seed(parsed_args.seed)
+    np.random.seed(parsed_args.seed)
     torch.manual_seed(parsed_args.seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed(parsed_args.seed)
+        torch.cuda.manual_seed_all(parsed_args.seed)
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(False)
+    except (AttributeError, RuntimeError):
+        pass
 
     pin_memory = device.type == 'cuda'
     non_blocking = device.type != 'cpu'
@@ -582,11 +592,39 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
         print('No masked layers found when collecting activation statistics.')
         return {}
 
+    if max_batches is not None:
+        max_batches = min(max_batches, 1500)
+
+    data_iterable = data_loader
+    if isinstance(data_loader, torch.utils.data.DataLoader):
+        loader_kwargs = {
+            'batch_size': data_loader.batch_size or 1,
+            'shuffle': False,
+            'num_workers': 0,
+            'pin_memory': data_loader.pin_memory,
+            'drop_last': False,
+        }
+        if data_loader.collate_fn is not None:
+            loader_kwargs['collate_fn'] = data_loader.collate_fn
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+        try:
+            data_iterable = torch.utils.data.DataLoader(
+                data_loader.dataset,
+                generator=generator,
+                **loader_kwargs,
+            )
+        except TypeError:
+            data_iterable = torch.utils.data.DataLoader(
+                data_loader.dataset,
+                **loader_kwargs,
+            )
+
     was_training = mdl.training
     mdl.eval()
     processed_samples = 0
     with torch.no_grad():
-        for batch_idx, batch in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_iterable):
             if max_batches is not None and batch_idx >= max_batches:
                 break
             if is_language_model:

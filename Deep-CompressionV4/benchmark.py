@@ -72,6 +72,8 @@ def parse_args():
                         help='directory to store results and plots')
     parser.add_argument('--pruning-script', default=PRUNING_SCRIPT,
                         help='path to pruning.py (auto-detected by default)')
+    parser.add_argument('--retrain-epochs-override', type=int, default=None,
+                        help='override retraining epochs for prune runs (default: match milestone)')
     parser.add_argument('--keep-intermediate', action='store_true',
                         help='retain intermediate metrics files (for debugging)')
     parser.add_argument(
@@ -260,6 +262,8 @@ def print_summary(aggregates):
 
 def main():
     args = parse_args()
+    if args.retrain_epochs_override is not None and args.retrain_epochs_override <= 0:
+        raise ValueError('--retrain-epochs-override must be positive when provided')
     output_dir = ensure_output_dir(args.output_dir)
     raw_metrics_path = os.path.join(output_dir, 'raw_metrics.jsonl')
     aggregated_csv_path = os.path.join(output_dir, 'raw_metrics.csv')
@@ -357,6 +361,7 @@ def main():
                 os.remove(train_metrics_file)
 
             for target in sparsity_targets:
+                retrain_epochs = args.retrain_epochs_override or epochs
                 for method in methods:
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jsonl') as tmp_metrics:
                         metrics_file = tmp_metrics.name
@@ -365,7 +370,7 @@ def main():
                         '--mode', 'prune',
                         '--model', args.model,
                         '--epochs', str(epochs),
-                        '--retrain-epochs', str(epochs),
+                        '--retrain-epochs', str(retrain_epochs),
                         '--pruning-method', method,
                         '--target-sparsity', f'{target}',
                         '--seed', str(seed),
