@@ -54,6 +54,8 @@ def parse_args():
                         help='fractions of weights to prune (0-1). Default: 0.5 0.8 0.9')
     parser.add_argument('--seeds', type=int, nargs='+', default=[42],
                         help='random seeds to average over (default: 42)')
+    parser.add_argument('--methods', nargs='+', choices=['std', 'neuronrank'], default=None,
+                        help='pruning methods to evaluate (default: std neuronrank)')
     parser.add_argument('--workers', type=int, default=None,
                         help='DataLoader worker override passed to pruning.py')
     parser.add_argument('--batch-size', type=int, default=None,
@@ -275,7 +277,9 @@ def main():
     sparsity_targets = sorted(set(args.sparsity_targets))
 
     records = []
-    methods = ['std', 'neuronrank']
+    methods = args.methods or ['std', 'neuronrank']
+    # Preserve user-specified order while removing duplicates
+    methods = list(dict.fromkeys(methods))
     need_neuronrank_stats = 'neuronrank' in methods
 
     total_steps = 0
