@@ -696,10 +696,12 @@ def collect_activation_statistics(
             continue
 
         def make_hook(layer_name):
-            def hook(_module, inputs, _output):
-                if not inputs:
-                    return
-                features = inputs[0]
+            def hook(module_ref, inputs, output):
+                features = None
+                if isinstance(module_ref, nn.Embedding):
+                    features = output
+                elif inputs:
+                    features = inputs[0]
                 if features is None:
                     return
 

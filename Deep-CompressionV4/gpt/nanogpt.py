@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from net.prune import MaskedLinear, PruningModule
+from net.prune import MaskedEmbedding, MaskedLinear, PruningModule
 
 
 @dataclass
@@ -115,8 +115,8 @@ class MaskedNanoGPT(PruningModule):
     def __init__(self, config: NanoGPTConfig) -> None:
         super().__init__()
         self.config = config
-        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        self.token_embedding_table = MaskedEmbedding(config.vocab_size, config.n_embd)
+        self.position_embedding_table = MaskedEmbedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd, elementwise_affine=config.bias)
