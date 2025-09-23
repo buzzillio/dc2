@@ -539,7 +539,6 @@ def _prune_neuron_groups_by_neuronrank(
         device = base_scores.device
         base_scores = base_scores.to(device=device, dtype=torch.float32)
 
-        main
         if mean_abs_activation.numel() != base_scores.numel() or doc_freq.numel() != base_scores.numel():
             print(f'Skipping group {group.name}: activation statistics shape mismatch.')
             continue
@@ -550,7 +549,6 @@ def _prune_neuron_groups_by_neuronrank(
         numerator = torch.tensor(sample_count + smooth + 1e-12, dtype=torch.float32, device=device)
         denominator = doc_freq.to(device=device) + smooth + 1e-12
 
-        main
         idf_component = torch.log(numerator / denominator)
         if idf_add != 0.0:
             idf_component = idf_component + idf_add
@@ -560,7 +558,6 @@ def _prune_neuron_groups_by_neuronrank(
 
         alive_mask = _neuron_alive_mask(group).to(device)
 
-        main
         if not torch.any(alive_mask):
             continue
         scores = scores.to(torch.float32)
