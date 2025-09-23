@@ -122,6 +122,7 @@ def _compute_gradient_components(
     *,
     grad_tf_power: float,
     grad_idf_power: float,
+    grad_idf_add: float,
     grad_smooth: float,
     normalise_doc_freq: bool,
 ) -> Optional[torch.Tensor]:
@@ -151,7 +152,10 @@ def _compute_gradient_components(
 
     numerator = torch.tensor(numerator_value, dtype=torch.float32, device=gradient_tf.device)
     denominator = denominator.to(device=gradient_tf.device, dtype=torch.float32)
-    grad_idf = torch.log(numerator / denominator).clamp(min=0.0).pow(grad_idf_power)
+    grad_idf = torch.log(numerator / denominator)
+    if grad_idf_add != 0.0:
+        grad_idf = grad_idf + grad_idf_add
+    grad_idf = grad_idf.clamp(min=0.0).pow(grad_idf_power)
 
     return gradient_tf * grad_idf
 
@@ -279,6 +283,7 @@ class PruningModule(Module):
         grad_smooth: float = 1.0,
         grad_tf_power: float = 1.0,
         grad_idf_power: float = 1.0,
+        grad_idf_add: float = 1.0,
         grad_power: float = 1.0,
         grad_mix: float = 0.75,
         grad_normalise_doc_freq: bool = True,
@@ -318,6 +323,8 @@ class PruningModule(Module):
             grad_smooth (float): Smoothing value applied to gradient-driven IDF terms.
             grad_tf_power (float): Exponent applied to the mean gradient magnitude.
             grad_idf_power (float): Exponent applied to the gradient-based IDF term.
+            grad_idf_add (float): Constant added to the gradient IDF term before applying
+                ``grad_idf_power``.
             grad_power (float): Exponent applied to the blended gradient specificity score.
             grad_mix (float): Blend factor between classic TF-IDF and gradient-aware
                 NeuronRank components (0 disables gradients, 1 uses gradients fully).
@@ -345,6 +352,7 @@ class PruningModule(Module):
                 grad_smooth=grad_smooth,
                 grad_tf_power=grad_tf_power,
                 grad_idf_power=grad_idf_power,
+                grad_idf_add=grad_idf_add,
                 grad_power=grad_power,
                 grad_mix=grad_mix,
                 grad_normalise_doc_freq=grad_normalise_doc_freq,
@@ -396,6 +404,7 @@ class PruningModule(Module):
                 global_stats,
                 grad_tf_power=grad_tf_power,
                 grad_idf_power=grad_idf_power,
+                grad_idf_add=grad_idf_add,
                 grad_smooth=grad_smooth,
                 normalise_doc_freq=grad_normalise_doc_freq,
             )
@@ -845,6 +854,7 @@ def _prune_neuron_groups_by_neuronrank(
     grad_smooth: float,
     grad_tf_power: float,
     grad_idf_power: float,
+    grad_idf_add: float,
     grad_power: float,
     grad_mix: float,
     grad_normalise_doc_freq: bool,
@@ -899,6 +909,7 @@ def _prune_neuron_groups_by_neuronrank(
             global_stats,
             grad_tf_power=grad_tf_power,
             grad_idf_power=grad_idf_power,
+            grad_idf_add=grad_idf_add,
             grad_smooth=grad_smooth,
             normalise_doc_freq=grad_normalise_doc_freq,
         )

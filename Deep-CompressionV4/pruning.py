@@ -181,6 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--neuronrank-grad-idf-power', type=float, default=1.0,
                         dest='neuronrank_grad_idf_power',
                         help='exponent applied to the gradient-based IDF term')
+    parser.add_argument('--neuronrank-grad-idf-add', type=float, default=1.0,
+                        dest='neuronrank_grad_idf_add',
+                        help='constant added to the gradient-based IDF term before exponentiation')
     parser.add_argument('--neuronrank-grad-power', type=float, default=1.0,
                         dest='neuronrank_grad_power',
                         help='exponent applied to the blended gradient specificity score')
@@ -1074,6 +1077,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
             grad_smooth=args.neuronrank_grad_smooth,
             grad_tf_power=args.neuronrank_grad_tf_power,
             grad_idf_power=args.neuronrank_grad_idf_power,
+            grad_idf_add=args.neuronrank_grad_idf_add,
             grad_power=args.neuronrank_grad_power,
             grad_mix=args.neuronrank_grad_mix,
             grad_normalise_doc_freq=args.neuronrank_class_normalise,
