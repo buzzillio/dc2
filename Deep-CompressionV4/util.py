@@ -7,6 +7,13 @@ from torch.nn.modules.module import Module
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 
+
+def _is_mlp_parameter(parameter_name: str) -> bool:
+    """Return ``True`` when a parameter belongs to an MLP submodule."""
+
+    return 'mlp' in parameter_name.lower()
+
+
 def log(filename, content):
     with open(filename, 'a') as f:
         content += "\n"
@@ -25,6 +32,7 @@ def print_model_parameters(model, with_values=False):
 def collect_nonzero_stats(model):
     """Return aggregate sparsity metrics for a pruned model."""
     nonzero = total = 0
+    mlp_nonzero = mlp_total = 0
     per_param = []
 
     for name, param in model.named_parameters():
@@ -35,6 +43,9 @@ def collect_nonzero_stats(model):
         total_params = int(np.prod(tensor.shape))
         nonzero += nz_count
         total += total_params
+        if _is_mlp_parameter(name):
+            mlp_nonzero += nz_count
+            mlp_total += total_params
         per_param.append({
             'name': name,
             'nonzero': nz_count,
@@ -44,7 +55,7 @@ def collect_nonzero_stats(model):
         })
 
     if total == 0:
-        return {
+        base_stats = {
             'alive': 0,
             'pruned': 0,
             'total': 0,
@@ -52,17 +63,34 @@ def collect_nonzero_stats(model):
             'compression_ratio': 1.0,
             'per_param': per_param,
         }
+    else:
+        sparsity = 1.0 - (nonzero / total)
+        compression_ratio = float('inf') if nonzero == 0 else total / nonzero
+        base_stats = {
+            'alive': int(nonzero),
+            'pruned': int(total - nonzero),
+            'total': int(total),
+            'sparsity': sparsity,
+            'compression_ratio': compression_ratio,
+            'per_param': per_param,
+        }
 
-    sparsity = 1.0 - (nonzero / total)
-    compression_ratio = float('inf') if nonzero == 0 else total / nonzero
-    return {
-        'alive': int(nonzero),
-        'pruned': int(total - nonzero),
-        'total': int(total),
-        'sparsity': sparsity,
-        'compression_ratio': compression_ratio,
-        'per_param': per_param,
-    }
+    if mlp_total > 0:
+        mlp_sparsity = 1.0 - (mlp_nonzero / mlp_total)
+        mlp_compression = float('inf') if mlp_nonzero == 0 else mlp_total / mlp_nonzero
+    else:
+        mlp_sparsity = 0.0
+        mlp_compression = 1.0
+
+    base_stats.update({
+        'mlp_alive': int(mlp_nonzero),
+        'mlp_pruned': int(mlp_total - mlp_nonzero),
+        'mlp_total': int(mlp_total),
+        'mlp_sparsity': mlp_sparsity,
+        'mlp_compression_ratio': mlp_compression,
+    })
+
+    return base_stats
 
 
 def print_nonzeros(model):
@@ -81,6 +109,13 @@ def print_nonzeros(model):
             f"alive: {stats['alive']}, pruned : {stats['pruned']}, total: {stats['total']}, "
             f"Compression rate : {stats['compression_ratio']:10.2f}x  ({100 * stats['sparsity']:6.2f}% pruned)"
         )
+        mlp_total = stats.get('mlp_total', 0)
+        if mlp_total > 0:
+            print(
+                f"MLP alive: {stats.get('mlp_alive', 0)}, pruned : {stats.get('mlp_pruned', 0)}, "
+                f"total: {mlp_total}, Compression rate : {stats.get('mlp_compression_ratio', 1.0):10.2f}x  "
+                f"({100 * stats.get('mlp_sparsity', 0.0):6.2f}% pruned)"
+            )
     else:
         print('Model contains no parameters to evaluate sparsity.')
 

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import time
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -452,10 +453,22 @@ def adjust_learning_rate(optimizer, epoch, base_lr):
         param_group['lr'] = lr
 
 
-def train_model(epochs: int, optimizer, mask_grad: bool = False):
+def train_model(
+    epochs: int,
+    optimizer,
+    mask_grad: bool = False,
+    phase_label: str = 'training',
+) -> Dict[str, float | int]:
     base_lr = args.lr
     dataset_size = len(train_loader.dataset)
+    epoch_durations = []
+    completed_epochs = 0
+
+    if epochs <= 0:
+        return {'average_epoch_time': 0.0, 'epochs_completed': 0}
+
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         adjust_learning_rate(optimizer, epoch, base_lr)
         model.train()
         pbar = tqdm(
@@ -488,7 +501,7 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
                         param.grad.mul_(mask)
 
             optimizer.step()
-            
+
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
                 # Calculate actual samples processed (handle variable batch sizes correctly)
@@ -502,14 +515,34 @@ def train_model(epochs: int, optimizer, mask_grad: bool = False):
             pbar.set_description(
                 f'Train Epoch: {epoch} [{done:5}/{dataset_size} ({pct:3.0f}%)]  Loss: {loss.item():.6f}'
             )
-            
-            # Log detailed info only at specified intervals 
+
+            # Log detailed info only at specified intervals
             if batch_idx % args.log_interval == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 pbar.set_postfix({
                     'loss': f'{loss.item():.6f}',
                     'lr': f'{current_lr:.2e}',
                 }, refresh=False)
+
+        epoch_duration = time.perf_counter() - epoch_start
+        epoch_durations.append(epoch_duration)
+        completed_epochs += 1
+
+    if completed_epochs > 0:
+        average_epoch_time = sum(epoch_durations) / completed_epochs
+        phase_slug = phase_label.replace(' ', '_').lower()
+        maybe_log(f'{phase_slug}_avg_epoch_time {average_epoch_time}')
+        print(
+            f'Average epoch time ({phase_label}): {average_epoch_time:.2f}s '
+            f'over {completed_epochs} epoch{"s" if completed_epochs != 1 else ""}.'
+        )
+    else:
+        average_epoch_time = 0.0
+
+    return {
+        'average_epoch_time': average_epoch_time,
+        'epochs_completed': completed_epochs,
+    }
 
 
 def evaluate_model() -> Dict[str, float]:
@@ -710,14 +743,21 @@ def load_model_for_pruning(checkpoint_path: str):
     return checkpoint
 
 
-def execute_training_phase(train_epochs: int, collect_stats: bool = False) -> Tuple[Dict[str, float], Optional[Dict]]:
+def execute_training_phase(
+    train_epochs: int, collect_stats: bool = False
+) -> Tuple[Dict[str, float], Optional[Dict], Dict[str, float | int]]:
     global model, criterion, eval_criterion, weight_masks
     model, criterion, eval_criterion = instantiate_model(args)
     weight_masks = build_weight_mask_map(model)
     optimizer = create_optimizer()
 
     print('--- Initial training ---')
-    train_model(train_epochs, optimizer, mask_grad=False)
+    training_time_info = train_model(
+        train_epochs,
+        optimizer,
+        mask_grad=False,
+        phase_label='initial training',
+    )
     eval_initial = evaluate_model()
     maybe_log_metric('initial', eval_initial)
     print_eval_snapshot('Initial evaluation', eval_initial)
@@ -737,7 +777,7 @@ def execute_training_phase(train_epochs: int, collect_stats: bool = False) -> Tu
             torch.save(stats, args.save_activation_stats)
             print(f'Saved activation statistics to {args.save_activation_stats}')
 
-    return eval_initial, stats
+    return eval_initial, stats, training_time_info
 
 
 def ensure_activation_stats(stats: Optional[Dict]) -> Dict:
@@ -764,7 +804,7 @@ def ensure_activation_stats(stats: Optional[Dict]) -> Dict:
 
 def run_training_mode():
     collect_stats = args.pruning_method == 'neuronrank' and args.save_activation_stats
-    eval_initial, _ = execute_training_phase(args.epochs, collect_stats)
+    eval_initial, _, training_time_info = execute_training_phase(args.epochs, collect_stats)
     metrics = {
         'mode': 'train',
         'model': args.model,
@@ -774,6 +814,9 @@ def run_training_mode():
         'eval_metric': evaluation_metric_key(),
     }
     update_metrics_with_eval(metrics, eval_initial, 'initial')
+    if training_time_info.get('epochs_completed'):
+        metrics['avg_epoch_time_initial'] = training_time_info['average_epoch_time']
+        metrics['epochs_completed_initial'] = training_time_info['epochs_completed']
     write_metrics(metrics)
 
 
@@ -813,11 +856,17 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
     retrain_epochs = args.retrain_epochs
     if retrain_epochs is None:
         retrain_epochs = args.epochs if args.epochs is not None else 0
+    retrain_time_info = {'average_epoch_time': 0.0, 'epochs_completed': 0}
     if retrain_epochs and retrain_epochs > 0:
         print('--- Retraining ---')
         weight_masks = build_weight_mask_map(model)
         optimizer = create_optimizer()
-        train_model(retrain_epochs, optimizer, mask_grad=True)
+        retrain_time_info = train_model(
+            retrain_epochs,
+            optimizer,
+            mask_grad=True,
+            phase_label='retraining',
+        )
 
     eval_after_retraining = evaluate_model()
     maybe_log_metric('after_retraining', eval_after_retraining)
@@ -825,7 +874,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
     print('--- After Retraining ---')
     util.print_nonzeros(model)
 
-    return sparsity_stats, eval_after_pruning, eval_after_retraining
+    return sparsity_stats, eval_after_pruning, eval_after_retraining, retrain_time_info
 
 
 def run_pruning_mode():
@@ -842,7 +891,12 @@ def run_pruning_mode():
         activation_stats = torch.load(args.activation_stats, map_location='cpu')
         print(f'Loaded activation statistics from {args.activation_stats}')
 
-    sparsity_stats, eval_after_pruning, eval_after_retraining = prune_and_retrain(activation_stats)
+    (
+        sparsity_stats,
+        eval_after_pruning,
+        eval_after_retraining,
+        retrain_time_info,
+    ) = prune_and_retrain(activation_stats)
 
     if not args.skip_model_save and args.output_checkpoint:
         save_checkpoint(args.output_checkpoint, args.retrain_epochs or args.epochs or 0)
@@ -862,9 +916,19 @@ def run_pruning_mode():
         'compression_ratio': sparsity_stats['compression_ratio'],
         'sparsity': sparsity_stats['sparsity'],
     }
+    metrics.update({
+        'mlp_alive_parameters': sparsity_stats.get('mlp_alive'),
+        'mlp_pruned_parameters': sparsity_stats.get('mlp_pruned'),
+        'mlp_total_parameters': sparsity_stats.get('mlp_total'),
+        'mlp_compression_ratio': sparsity_stats.get('mlp_compression_ratio'),
+        'mlp_sparsity': sparsity_stats.get('mlp_sparsity'),
+    })
     update_metrics_with_eval(metrics, eval_initial, 'initial')
     update_metrics_with_eval(metrics, eval_after_pruning, 'after_pruning')
     update_metrics_with_eval(metrics, eval_after_retraining, 'after_retraining')
+    if retrain_time_info.get('epochs_completed'):
+        metrics['avg_epoch_time_retraining'] = retrain_time_info['average_epoch_time']
+        metrics['epochs_completed_retraining'] = retrain_time_info['epochs_completed']
     if args.pruning_method == 'neuronrank':
         metrics.update({
             'neuronrank_percentile': args.neuronrank_percentile,
@@ -882,7 +946,7 @@ def run_pruning_mode():
 def run_full_mode():
     need_stats = args.pruning_method == 'neuronrank'
     cache_stats = need_stats and (args.save_activation_stats or not args.activation_stats)
-    eval_initial, stats = execute_training_phase(args.epochs, cache_stats)
+    eval_initial, stats, training_time_info = execute_training_phase(args.epochs, cache_stats)
 
     if args.pruning_method == 'neuronrank':
         if args.save_activation_stats and args.save_activation_stats and os.path.exists(args.save_activation_stats):
@@ -894,7 +958,12 @@ def run_full_mode():
     else:
         activation_stats = None
 
-    sparsity_stats, eval_after_pruning, eval_after_retraining = prune_and_retrain(activation_stats)
+    (
+        sparsity_stats,
+        eval_after_pruning,
+        eval_after_retraining,
+        retrain_time_info,
+    ) = prune_and_retrain(activation_stats)
 
     if not args.skip_model_save and args.output_checkpoint:
         save_checkpoint(args.output_checkpoint, args.retrain_epochs or args.epochs)
@@ -914,9 +983,22 @@ def run_full_mode():
         'compression_ratio': sparsity_stats['compression_ratio'],
         'sparsity': sparsity_stats['sparsity'],
     }
+    metrics.update({
+        'mlp_alive_parameters': sparsity_stats.get('mlp_alive'),
+        'mlp_pruned_parameters': sparsity_stats.get('mlp_pruned'),
+        'mlp_total_parameters': sparsity_stats.get('mlp_total'),
+        'mlp_compression_ratio': sparsity_stats.get('mlp_compression_ratio'),
+        'mlp_sparsity': sparsity_stats.get('mlp_sparsity'),
+    })
     update_metrics_with_eval(metrics, eval_initial, 'initial')
     update_metrics_with_eval(metrics, eval_after_pruning, 'after_pruning')
     update_metrics_with_eval(metrics, eval_after_retraining, 'after_retraining')
+    if training_time_info.get('epochs_completed'):
+        metrics['avg_epoch_time_initial'] = training_time_info['average_epoch_time']
+        metrics['epochs_completed_initial'] = training_time_info['epochs_completed']
+    if retrain_time_info.get('epochs_completed'):
+        metrics['avg_epoch_time_retraining'] = retrain_time_info['average_epoch_time']
+        metrics['epochs_completed_retraining'] = retrain_time_info['epochs_completed']
     if args.pruning_method == 'neuronrank':
         metrics.update({
             'neuronrank_percentile': args.neuronrank_percentile,
