@@ -820,7 +820,8 @@ def _prune_neuron_groups_by_neuronrank(
                     continue
                 class_score = base_scores * tf_cls.to(device=device, dtype=torch.float32) * idf_cls.to(device=device, dtype=torch.float32)
                 class_score = class_score * alive_mask.to(class_score.dtype)
-                feature_scores = feature_scores_cls.to(dtype=torch.float32) * alive_mask.to(dtype=torch.float32)
+                feature_scores = feature_scores_cls.to(device=device, dtype=torch.float32)
+                feature_scores = feature_scores * alive_mask.to(dtype=feature_scores.dtype)
                 per_class_infos.append(
                     {
                         'class_id': class_label,
