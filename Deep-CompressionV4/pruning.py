@@ -150,6 +150,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--neuronrank-max-batches', type=int, default=None,
                         dest='neuronrank_max_batches',
                         help='limit batches when collecting NeuronRank statistics')
+    parser.add_argument('--neuronrank-class-aggregation', choices=['pooled', 'max', 'mean'], default='pooled',
+                        dest='neuronrank_class_aggregation',
+                        help='strategy to combine per-class NeuronRank scores (pooled/global, max, or mean)')
+    parser.add_argument('--neuronrank-coverage-topk', type=int, default=0,
+                        dest='neuronrank_coverage_topk',
+                        help='reserve the top-k neurons per class when computing NeuronRank scores (0 disables)')
+    parser.add_argument('--neuronrank-entropy-penalty', type=float, default=0.0,
+                        dest='neuronrank_entropy_penalty',
+                        help='apply an entropy-based penalty to neurons that fire uniformly across classes (0 disables)')
+    parser.add_argument('--neuronrank-class-normalise', action='store_true',
+                        dest='neuronrank_class_normalise',
+                        help='normalise per-class document frequency counts by their sample totals when computing IDF')
+    parser.add_argument('--no-neuronrank-class-normalise', action='store_false',
+                        dest='neuronrank_class_normalise', help=argparse.SUPPRESS)
+    parser.set_defaults(neuronrank_class_normalise=True)
 
     # Hidden aliases for legacy TF-IDF flags
     parser.add_argument('--tfidf-activation-threshold', type=float,
@@ -590,12 +605,24 @@ def evaluate_model() -> Dict[str, float]:
     return {'loss': test_loss, 'accuracy': accuracy, 'examples': total}
 
 
-def collect_activation_statistics(mdl: nn.Module, data_loader, activation_threshold=0.05,
-                                   max_batches: Optional[int] = None) -> Dict:
+def collect_activation_statistics(
+    mdl: nn.Module,
+    data_loader,
+    activation_threshold=0.05,
+    max_batches: Optional[int] = None,
+) -> Dict:
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     handles = []
 
     is_language_model = args.model in ('gpt2', 'nanogpt')
+    current_targets: Optional[torch.Tensor] = None
+
+    def init_stat_vector(feature_count: int):
+        return {
+            'sum_abs_activation': torch.zeros(feature_count, dtype=torch.float32),
+            'doc_freq': torch.zeros(feature_count, dtype=torch.float32),
+            'sample_count': 0,
+        }
 
     for name, module in mdl.named_modules():
         if not hasattr(module, 'mask'):
@@ -621,14 +648,48 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
                 flattened = flattened.to(dtype=torch.float32, device='cpu')
                 present = (flattened > activation_threshold).to(dtype=torch.float32)
 
-                layer_stats = stats.setdefault(layer_name, {
-                    'sum_abs_activation': torch.zeros(flattened.size(1), dtype=torch.float32),
-                    'doc_freq': torch.zeros(flattened.size(1), dtype=torch.float32),
-                    'sample_count': 0,
-                })
-                layer_stats['sum_abs_activation'] += flattened.sum(dim=0)
-                layer_stats['doc_freq'] += present.sum(dim=0)
-                layer_stats['sample_count'] += flattened.size(0)
+                feature_count = flattened.size(1)
+                layer_stats = stats.setdefault(
+                    layer_name,
+                    {
+                        'global': init_stat_vector(feature_count),
+                        'per_class': {},
+                    },
+                )
+
+                global_stats = layer_stats['global']
+                global_stats['sum_abs_activation'] += flattened.sum(dim=0)
+                global_stats['doc_freq'] += present.sum(dim=0)
+                global_stats['sample_count'] += flattened.size(0)
+
+                targets = current_targets
+                if targets is None:
+                    return
+
+                if not isinstance(targets, torch.Tensor):
+                    return
+
+                if targets.dim() == 0:
+                    targets = targets.view(1)
+
+                if targets.numel() != flattened.size(0):
+                    return
+
+                targets = targets.to(dtype=torch.long, device='cpu')
+                unique_classes = torch.unique(targets)
+                per_class_stats = layer_stats['per_class']
+                for class_value in unique_classes.tolist():
+                    class_mask = targets == class_value
+                    if not torch.any(class_mask):
+                        continue
+                    class_count = int(class_mask.sum().item())
+                    class_entry = per_class_stats.setdefault(
+                        int(class_value),
+                        init_stat_vector(feature_count),
+                    )
+                    class_entry['sum_abs_activation'] += flattened[class_mask].sum(dim=0)
+                    class_entry['doc_freq'] += present[class_mask].sum(dim=0)
+                    class_entry['sample_count'] += class_count
 
             return hook
 
@@ -674,6 +735,7 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
             if max_batches is not None and batch_idx >= max_batches:
                 break
             if is_language_model:
+                current_targets = None
                 inputs = {
                     key: value.to(device, non_blocking=non_blocking)
                     for key, value in batch.items()
@@ -684,8 +746,13 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
             else:
                 data, _target = batch
                 data = data.to(device, non_blocking=non_blocking)
+                if isinstance(_target, torch.Tensor):
+                    current_targets = _target.detach().to(device='cpu')
+                else:
+                    current_targets = torch.as_tensor(_target, dtype=torch.long)
                 processed_samples += data.size(0)
                 mdl(data)
+                current_targets = None
 
     for handle in handles:
         handle.remove()
@@ -694,13 +761,36 @@ def collect_activation_statistics(mdl: nn.Module, data_loader, activation_thresh
         mdl.train()
 
     for layer_name, layer_stats in stats.items():
-        count = layer_stats['sample_count']
+        global_stats = layer_stats.get('global', {})
+        count = int(global_stats.get('sample_count', 0))
         if count > 0:
-            layer_stats['mean_abs_activation'] = layer_stats['sum_abs_activation'] / count
+            mean_activation = global_stats['sum_abs_activation'] / count
         else:
-            layer_stats['mean_abs_activation'] = torch.zeros_like(layer_stats['sum_abs_activation'])
-        layer_stats['doc_freq'] = layer_stats['doc_freq'].clamp_(min=0.0, max=float(count))
-        del layer_stats['sum_abs_activation']
+            mean_activation = torch.zeros_like(global_stats['sum_abs_activation'])
+        global_stats['mean_abs_activation'] = mean_activation
+        global_stats['doc_freq'] = global_stats['doc_freq'].clamp_(min=0.0, max=float(count))
+        del global_stats['sum_abs_activation']
+
+        per_class_stats = layer_stats.get('per_class', {})
+        for class_id, class_stats in per_class_stats.items():
+            class_count = int(class_stats.get('sample_count', 0))
+            if class_count > 0:
+                class_mean = class_stats['sum_abs_activation'] / class_count
+            else:
+                class_mean = torch.zeros_like(class_stats['sum_abs_activation'])
+            class_stats['mean_abs_activation'] = class_mean
+            class_stats['doc_freq'] = class_stats['doc_freq'].clamp_(
+                min=0.0,
+                max=float(class_count),
+            )
+            del class_stats['sum_abs_activation']
+            per_class_stats[class_id] = class_stats
+
+        layer_stats['per_class'] = per_class_stats
+        layer_stats['global'] = global_stats
+        layer_stats['mean_abs_activation'] = global_stats['mean_abs_activation']
+        layer_stats['doc_freq'] = global_stats['doc_freq']
+        layer_stats['sample_count'] = count
 
     print(f'Collected activation statistics from {processed_samples} samples for NeuronRank pruning.')
     return stats
@@ -839,6 +929,10 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
             idf_power=args.neuronrank_idf_power,
             tf_power=args.neuronrank_tf_power,
             weight_power=args.neuronrank_weight_power,
+            class_aggregation=args.neuronrank_class_aggregation,
+            coverage_topk=args.neuronrank_coverage_topk,
+            entropy_penalty=args.neuronrank_entropy_penalty,
+            class_normalise_doc_freq=args.neuronrank_class_normalise,
         )
     else:
         if target_percentile is not None:
@@ -939,6 +1033,10 @@ def run_pruning_mode():
             'neuronrank_tf_power': args.neuronrank_tf_power,
             'neuronrank_weight_power': args.neuronrank_weight_power,
             'neuronrank_global_threshold': args.neuronrank_global_threshold,
+            'neuronrank_class_aggregation': args.neuronrank_class_aggregation,
+            'neuronrank_coverage_topk': args.neuronrank_coverage_topk,
+            'neuronrank_entropy_penalty': args.neuronrank_entropy_penalty,
+            'neuronrank_class_normalise': args.neuronrank_class_normalise,
         })
     write_metrics(metrics)
 
@@ -1009,6 +1107,10 @@ def run_full_mode():
             'neuronrank_tf_power': args.neuronrank_tf_power,
             'neuronrank_weight_power': args.neuronrank_weight_power,
             'neuronrank_global_threshold': args.neuronrank_global_threshold,
+            'neuronrank_class_aggregation': args.neuronrank_class_aggregation,
+            'neuronrank_coverage_topk': args.neuronrank_coverage_topk,
+            'neuronrank_entropy_penalty': args.neuronrank_entropy_penalty,
+            'neuronrank_class_normalise': args.neuronrank_class_normalise,
         })
     write_metrics(metrics)
 

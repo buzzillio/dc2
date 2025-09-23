@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -10,6 +10,128 @@ import torch.nn as nn
 from torch.nn import Parameter
 from torch.nn.modules.module import Module
 import torch.nn.functional as F
+
+EPS = 1e-12
+
+
+@dataclass
+class TFIDFComponents:
+    tf_component: torch.Tensor
+    idf_component: torch.Tensor
+    feature_scores: torch.Tensor
+    axis: str
+
+
+def _compute_tfidf_base(
+    stats: Dict,
+    *,
+    tf_power: float,
+    idf_power: float,
+    idf_add: float,
+    idf_smooth: float,
+    normalise_doc_freq: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if stats is None:
+        return None
+
+    sample_count = int(stats.get('sample_count', 0))
+    if sample_count == 0:
+        return None
+
+    mean_abs_activation = stats.get('mean_abs_activation')
+    doc_freq = stats.get('doc_freq')
+    if mean_abs_activation is None or doc_freq is None:
+        return None
+
+    mean_abs_activation = mean_abs_activation.to(torch.float32)
+    doc_freq = doc_freq.to(torch.float32)
+
+    tf_vector = mean_abs_activation.clamp(min=0.0).pow(tf_power)
+
+    smooth = idf_smooth if idf_smooth > 0 else 0.0
+    if normalise_doc_freq and sample_count > 0:
+        doc_component = (doc_freq / float(sample_count)).clamp(min=0.0, max=1.0)
+        numerator_value = 1.0 + smooth + EPS
+        denominator = doc_component + smooth + EPS
+    else:
+        numerator_value = float(sample_count) + smooth + EPS
+        denominator = doc_freq + smooth + EPS
+
+    numerator = torch.tensor(numerator_value, dtype=torch.float32)
+    idf_vector = torch.log(numerator / denominator)
+    if idf_add != 0.0:
+        idf_vector = idf_vector + idf_add
+    idf_vector = idf_vector.clamp(min=0.0).pow(idf_power)
+
+    feature_scores = tf_vector * idf_vector
+    return tf_vector, idf_vector, feature_scores
+
+
+def _determine_feature_axis(weight: torch.Tensor, feature_len: int) -> Optional[str]:
+    if feature_len == weight.size(1):
+        return 'input'
+    if feature_len == weight.size(0):
+        return 'output'
+    return None
+
+
+def _reshape_for_axis(vector: torch.Tensor, weight: torch.Tensor, axis: str) -> torch.Tensor:
+    if weight.dim() > 2:
+        if axis == 'input':
+            shape = (1, -1) + (1,) * (weight.dim() - 2)
+        else:
+            shape = (-1,) + (1,) * (weight.dim() - 1)
+    else:
+        shape = (1, -1) if axis == 'input' else (-1, 1)
+    return vector.reshape(shape)
+
+
+def _build_weight_tfidf_components(
+    stats: Dict,
+    weight: torch.Tensor,
+    *,
+    tf_power: float,
+    idf_power: float,
+    idf_add: float,
+    idf_smooth: float,
+    normalise_doc_freq: bool,
+) -> Optional[TFIDFComponents]:
+    base = _compute_tfidf_base(
+        stats,
+        tf_power=tf_power,
+        idf_power=idf_power,
+        idf_add=idf_add,
+        idf_smooth=idf_smooth,
+        normalise_doc_freq=normalise_doc_freq,
+    )
+    if base is None:
+        return None
+
+    tf_vector, idf_vector, feature_scores = base
+    axis = _determine_feature_axis(weight, tf_vector.numel())
+    if axis is None:
+        return None
+
+    tf_component = _reshape_for_axis(tf_vector, weight, axis)
+    idf_component = _reshape_for_axis(idf_vector, weight, axis)
+    return TFIDFComponents(tf_component=tf_component, idf_component=idf_component, feature_scores=feature_scores, axis=axis)
+
+
+def _mark_coverage(mask: torch.Tensor, axis: str, indices: torch.Tensor) -> None:
+    if indices.numel() == 0:
+        return
+    indices = indices.to(dtype=torch.long)
+    if axis == 'input':
+        if mask.dim() == 2:
+            mask[:, indices] = True
+        else:
+            mask[:, indices, ...] = True
+    else:
+        if mask.dim() == 2:
+            mask[indices, :] = True
+        else:
+            mask[indices, ...] = True
+
 
 class PruningModule(Module):
     def _neuron_pruning_groups(self) -> List['NeuronPruningGroup']:
@@ -86,13 +208,19 @@ class PruningModule(Module):
         idf_power=1.0,
         tf_power=1.0,
         weight_power=1.0,
+        class_aggregation: str = 'pooled',
+        coverage_topk: int = 0,
+        entropy_penalty: float = 0.0,
+        class_normalise_doc_freq: bool = True,
     ):
         """Prune connections using a NeuronRank (NeuronRank inspired) inspired score.
 
         Args:
             activation_stats (dict): Statistics collected from a dataset. Each key is a
                 module name and each value is a dict containing ``mean_abs_activation``,
-                ``doc_freq`` and ``sample_count`` tensors.
+                ``doc_freq`` and ``sample_count`` tensors. When available, a ``per_class``
+                mapping containing the same fields per class is used for multi-task
+                aggregation.
             sensitivity (float): Multiplier applied to the standard deviation of the
                 scores when ``percentile`` is not provided. Higher values keep more
                 connections.
@@ -108,6 +236,15 @@ class PruningModule(Module):
             tf_power (float): Exponent applied to the TF (mean absolute activation)
                 term.
             weight_power (float): Exponent applied to the absolute weight magnitude.
+            class_aggregation (str): Strategy for combining per-class scores. ``'pooled'``
+                falls back to global statistics, ``'max'`` emphasises neurons that are
+                important to any class, and ``'mean'`` averages per-class scores.
+            coverage_topk (int): Reserve the top-k TF-IDF neurons per class (per layer).
+                Set to 0 to disable.
+            entropy_penalty (float): Strength of the entropy-based penalty applied to
+                neurons that activate uniformly across classes. 0 disables it.
+            class_normalise_doc_freq (bool): If ``True`` normalise per-class document
+                frequencies by their sample counts during IDF computation.
         """
 
         neuron_groups = self._neuron_pruning_groups()
@@ -123,13 +260,16 @@ class PruningModule(Module):
                 idf_power=idf_power,
                 tf_power=tf_power,
                 weight_power=weight_power,
+                class_aggregation=class_aggregation,
+                coverage_topk=coverage_topk,
+                entropy_penalty=entropy_penalty,
+                class_normalise_doc_freq=class_normalise_doc_freq,
             )
             return
 
         if percentile is not None and not (0.0 <= percentile <= 100.0):
             raise ValueError('percentile must be between 0 and 100')
 
-        eps = 1e-12
         layer_records = []
         global_scores = []
 
@@ -145,8 +285,6 @@ class PruningModule(Module):
             if sample_count == 0:
                 continue
 
-            mean_abs_activation = stats['mean_abs_activation'].to(torch.float32)
-            doc_freq = stats['doc_freq'].to(torch.float32)
             weight = module.weight.detach().to(torch.device('cpu'), dtype=torch.float32)
             mask = module.mask.detach().to(torch.device('cpu'), dtype=torch.float32)
 
@@ -154,51 +292,134 @@ class PruningModule(Module):
                 continue
 
             weight_component = weight.abs().pow(weight_power)
-            tf_component = mean_abs_activation.clamp(min=0.0).pow(tf_power)
-            smooth = idf_smooth if idf_smooth > 0 else 0.0
-            numerator = torch.tensor(sample_count + smooth + eps, dtype=torch.float32)
-            denominator = doc_freq + smooth + eps
-            idf_component = torch.log(numerator / denominator)
-            if idf_add != 0.0:
-                idf_component = idf_component + idf_add
-            idf_component = idf_component.clamp(min=0.0).pow(idf_power)
 
-            if weight.dim() > 2:
-                view_shape = (1, -1) + (1,) * (weight.dim() - 2)
-                tf_component = tf_component.reshape(view_shape)
-                idf_component = idf_component.reshape(view_shape)
-            else:
-                feature_len = tf_component.numel()
-                if feature_len == weight.size(1):
-                    tf_component = tf_component.reshape(1, -1)
-                    idf_component = idf_component.reshape(1, -1)
-                elif feature_len == weight.size(0):
-                    tf_component = tf_component.reshape(-1, 1)
-                    idf_component = idf_component.reshape(-1, 1)
-                else:
-                    raise RuntimeError(
-                        f'Mismatch between activation stats (len={feature_len}) and weight shape '
-                        f'{tuple(weight.shape)} for layer {name}'
+            global_stats = stats.get('global', stats)
+            components = _build_weight_tfidf_components(
+                global_stats,
+                weight,
+                tf_power=tf_power,
+                idf_power=idf_power,
+                idf_add=idf_add,
+                idf_smooth=idf_smooth,
+                normalise_doc_freq=False,
+            )
+            if components is None:
+                continue
+
+            scores = weight_component * components.tf_component * components.idf_component
+
+            need_class_stats = (
+                class_aggregation != 'pooled'
+                or coverage_topk > 0
+                or entropy_penalty > 0.0
+            )
+
+            per_class_infos = []
+            if need_class_stats:
+                per_class_stats = stats.get('per_class') or {}
+                for class_label, class_stats in per_class_stats.items():
+                    class_components = _build_weight_tfidf_components(
+                        class_stats,
+                        weight,
+                        tf_power=tf_power,
+                        idf_power=idf_power,
+                        idf_add=idf_add,
+                        idf_smooth=idf_smooth,
+                        normalise_doc_freq=class_normalise_doc_freq,
                     )
+                    if class_components is None:
+                        continue
+                    class_score = weight_component * class_components.tf_component * class_components.idf_component
+                    per_class_infos.append(
+                        {
+                            'class_id': class_label,
+                            'scores': class_score,
+                            'feature_scores': class_components.feature_scores,
+                            'axis': class_components.axis,
+                        }
+                    )
+                if not per_class_infos and need_class_stats:
+                    print(f'Layer {name}: per-class activation statistics unavailable; falling back to pooled scoring.')
 
-            scores = weight_component * tf_component * idf_component
+            if class_aggregation in ('max', 'mean') and per_class_infos:
+                stacked = torch.stack([info['scores'] for info in per_class_infos])
+                if class_aggregation == 'max':
+                    aggregated = torch.max(stacked, dim=0).values
+                    scores = torch.max(scores, aggregated)
+                else:
+                    scores = stacked.mean(dim=0)
+
+            axes = {info['axis'] for info in per_class_infos}
+            coverage_mask = torch.zeros_like(weight_component, dtype=torch.bool)
+            coverage_reserved = 0
+
+            if entropy_penalty > 0.0 and per_class_infos:
+                if len(axes) == 1 and len(per_class_infos) > 1:
+                    axis = next(iter(axes))
+                    feature_stack = torch.stack([info['feature_scores'] for info in per_class_infos])
+                    totals = feature_stack.sum(dim=0, keepdim=True)
+                    probs = feature_stack / (totals + EPS)
+                    entropy = -(probs * (probs + EPS).log()).sum(dim=0)
+                    max_entropy = math.log(len(per_class_infos)) if len(per_class_infos) > 0 else 0.0
+                    if max_entropy > 0:
+                        penalty = (1.0 - entropy / max_entropy).clamp(min=0.0)
+                        if entropy_penalty != 1.0:
+                            penalty = penalty.pow(entropy_penalty)
+                        penalty = penalty.clamp(min=1e-6)
+                        penalty = _reshape_for_axis(penalty, weight, axis)
+                        scores = scores * penalty
+                elif entropy_penalty > 0.0:
+                    print(f'Layer {name}: inconsistent per-class axes; skipping entropy penalty.')
+
+            if coverage_topk > 0 and per_class_infos:
+                axes_for_coverage = {info['axis'] for info in per_class_infos}
+                if len(axes_for_coverage) == 1:
+                    axis = next(iter(axes_for_coverage))
+                    for info in per_class_infos:
+                        feature_scores = info['feature_scores']
+                        if feature_scores.numel() == 0:
+                            continue
+                        k = min(coverage_topk, feature_scores.numel())
+                        if k <= 0:
+                            continue
+                        _, indices = torch.topk(feature_scores, k=k, sorted=False)
+                        _mark_coverage(coverage_mask, axis, indices)
+                    if torch.any(coverage_mask):
+                        base_values = scores[~coverage_mask]
+                        if base_values.numel() > 0:
+                            max_value = base_values.max().item()
+                            boost_value = float(max_value + abs(max_value) + 1.0)
+                        else:
+                            boost_value = 1.0
+                        scores = scores.clone()
+                        scores[coverage_mask] = boost_value
+                        coverage_reserved = int(coverage_mask.sum().item())
+                else:
+                    print(f'Layer {name}: inconsistent per-class axes; skipping coverage constraint.')
+
             scores = scores * mask
 
             prunable = mask > 0
-            if not torch.any(prunable):
+            eligible_mask = prunable & ~coverage_mask
+            eligible_scores = scores[eligible_mask]
+
+            if eligible_scores.numel() == 0:
+                if coverage_reserved > 0:
+                    print(f'Layer {name}: all connections reserved by coverage constraint; skipping pruning.')
                 continue
 
-            alive_scores = scores[prunable]
             layer_records.append({
                 'name': name,
                 'module': module,
                 'scores': scores,
-                'alive_scores': alive_scores,
+                'eligible_scores': eligible_scores,
+                'eligible_mask': eligible_mask,
                 'mask': mask,
+                'coverage_reserved': coverage_reserved,
             })
 
             if global_threshold:
-                global_scores.append(alive_scores)
+                global_scores.append(eligible_scores)
 
         if not layer_records:
             print('No layers eligible for NeuronRank (NeuronRank inspired) pruning. Skipping.')
@@ -221,11 +442,13 @@ class PruningModule(Module):
                 name = record['name']
                 module = record['module']
                 scores = record['scores']
-                mask_tensor = record['mask']
-                prunable = mask_tensor > 0
-                pruned = int(torch.sum(prunable & (scores < threshold_value)).item())
-                total = int(torch.sum(prunable).item())
-                print(f'Layer {name}: pruning {pruned}/{total} connections using global NeuronRank (NeuronRank inspired) threshold {threshold_value}')
+                eligible_mask = record['eligible_mask']
+                coverage_reserved = record.get('coverage_reserved', 0)
+                prune_candidates = eligible_mask & (scores < threshold_value)
+                pruned = int(prune_candidates.sum().item())
+                total = int(eligible_mask.sum().item())
+                extra = f' (coverage reserved {coverage_reserved})' if coverage_reserved else ''
+                print(f'Layer {name}: pruning {pruned}/{total} eligible connections using global NeuronRank (NeuronRank inspired) threshold {threshold_value}{extra}')
                 module.prune_with_scores(scores, threshold_value)
             return
 
@@ -233,21 +456,23 @@ class PruningModule(Module):
             name = record['name']
             module = record['module']
             scores = record['scores']
-            alive_scores = record['alive_scores']
-            mask_tensor = record['mask']
-            prunable = mask_tensor > 0
+            eligible_scores = record['eligible_scores']
+            eligible_mask = record['eligible_mask']
+            coverage_reserved = record.get('coverage_reserved', 0)
 
             if percentile is not None:
-                threshold_value = float(np.percentile(alive_scores.numpy(), percentile))
+                threshold_value = float(np.percentile(eligible_scores.numpy(), percentile))
                 print(f'Layer {name}: NeuronRank (NeuronRank inspired) pruning threshold (percentile {percentile}): {threshold_value}')
             else:
-                score_std = alive_scores.std(unbiased=False).item()
+                score_std = eligible_scores.std(unbiased=False).item()
                 threshold_value = score_std * sensitivity
                 print(f'Layer {name}: NeuronRank (NeuronRank inspired) pruning threshold (std {score_std} * sensitivity {sensitivity}): {threshold_value}')
 
-            pruned = int(torch.sum(prunable & (scores < threshold_value)).item())
-            total = int(torch.sum(prunable).item())
-            print(f'Layer {name}: pruning {pruned}/{total} connections using NeuronRank (NeuronRank inspired) scores')
+            prune_candidates = eligible_mask & (scores < threshold_value)
+            pruned = int(prune_candidates.sum().item())
+            total = int(eligible_mask.sum().item())
+            extra = f' (coverage reserved {coverage_reserved})' if coverage_reserved else ''
+            print(f'Layer {name}: pruning {pruned}/{total} eligible connections using NeuronRank (NeuronRank inspired) scores{extra}')
             module.prune_with_scores(scores, threshold_value)
 
 
@@ -512,6 +737,10 @@ def _prune_neuron_groups_by_neuronrank(
     idf_power: float,
     tf_power: float,
     weight_power: float,
+    class_aggregation: str,
+    coverage_topk: int,
+    entropy_penalty: float,
+    class_normalise_doc_freq: bool,
 ) -> None:
     """Neuron-level NeuronRank pruning for supported models."""
 
@@ -531,44 +760,132 @@ def _prune_neuron_groups_by_neuronrank(
         sample_count = stats.get('sample_count', 0)
         if sample_count == 0:
             continue
-        mean_abs_activation = stats['mean_abs_activation'].to(torch.float32)
-        doc_freq = stats['doc_freq'].to(torch.float32)
 
         base_scores = _compute_neuron_magnitude_scores(group).pow(weight_power)
 
         device = base_scores.device
         base_scores = base_scores.to(device=device, dtype=torch.float32)
 
-        if mean_abs_activation.numel() != base_scores.numel() or doc_freq.numel() != base_scores.numel():
+        global_stats = stats.get('global', stats)
+        base_components = _compute_tfidf_base(
+            global_stats,
+            tf_power=tf_power,
+            idf_power=idf_power,
+            idf_add=idf_add,
+            idf_smooth=idf_smooth,
+            normalise_doc_freq=False,
+        )
+        if base_components is None:
+            continue
+
+        tf_vector, idf_vector, _ = base_components
+        if tf_vector.numel() != base_scores.numel() or idf_vector.numel() != base_scores.numel():
             print(f'Skipping group {group.name}: activation statistics shape mismatch.')
             continue
 
-
-        tf_component = mean_abs_activation.to(device=device).clamp(min=0.0).pow(tf_power)
-        smooth = idf_smooth if idf_smooth > 0 else 0.0
-        numerator = torch.tensor(sample_count + smooth + 1e-12, dtype=torch.float32, device=device)
-        denominator = doc_freq.to(device=device) + smooth + 1e-12
-
-        idf_component = torch.log(numerator / denominator)
-        if idf_add != 0.0:
-            idf_component = idf_component + idf_add
-        idf_component = idf_component.clamp(min=0.0).pow(idf_power)
+        tf_component = tf_vector.to(device=device, dtype=torch.float32)
+        idf_component = idf_vector.to(device=device, dtype=torch.float32)
 
         scores = base_scores * tf_component * idf_component
 
         alive_mask = _neuron_alive_mask(group).to(device)
-
         if not torch.any(alive_mask):
             continue
-        scores = scores.to(torch.float32)
+
+        alive_mask = alive_mask.to(dtype=torch.bool)
         scores = scores * alive_mask.to(scores.dtype)
-        alive_scores = scores[alive_mask]
-        if alive_scores.numel() == 0:
+
+        need_class_stats = (
+            class_aggregation != 'pooled'
+            or coverage_topk > 0
+            or entropy_penalty > 0.0
+        )
+
+        per_class_infos = []
+        if need_class_stats:
+            per_class_stats = stats.get('per_class') or {}
+            for class_label, class_stats in per_class_stats.items():
+                class_components = _compute_tfidf_base(
+                    class_stats,
+                    tf_power=tf_power,
+                    idf_power=idf_power,
+                    idf_add=idf_add,
+                    idf_smooth=idf_smooth,
+                    normalise_doc_freq=class_normalise_doc_freq,
+                )
+                if class_components is None:
+                    continue
+                tf_cls, idf_cls, feature_scores_cls = class_components
+                if tf_cls.numel() != base_scores.numel() or idf_cls.numel() != base_scores.numel():
+                    continue
+                class_score = base_scores * tf_cls.to(device=device, dtype=torch.float32) * idf_cls.to(device=device, dtype=torch.float32)
+                class_score = class_score * alive_mask.to(class_score.dtype)
+                feature_scores = feature_scores_cls.to(dtype=torch.float32) * alive_mask.to(dtype=torch.float32)
+                per_class_infos.append(
+                    {
+                        'class_id': class_label,
+                        'scores': class_score,
+                        'feature_scores': feature_scores,
+                    }
+                )
+            if not per_class_infos and need_class_stats:
+                print(f'Group {group.name}: per-class activation statistics unavailable; falling back to pooled scoring.')
+
+        if class_aggregation in ('max', 'mean') and per_class_infos:
+            stacked = torch.stack([info['scores'] for info in per_class_infos])
+            if class_aggregation == 'max':
+                aggregated = torch.max(stacked, dim=0).values
+                scores = torch.max(scores, aggregated)
+            else:
+                scores = stacked.mean(dim=0)
+
+        if entropy_penalty > 0.0 and len(per_class_infos) > 1:
+            feature_stack = torch.stack([info['feature_scores'] for info in per_class_infos])
+            totals = feature_stack.sum(dim=0, keepdim=True)
+            probs = feature_stack / (totals + EPS)
+            entropy = -(probs * (probs + EPS).log()).sum(dim=0)
+            max_entropy = math.log(len(per_class_infos)) if len(per_class_infos) > 0 else 0.0
+            if max_entropy > 0:
+                penalty = (1.0 - entropy / max_entropy).clamp(min=0.0)
+                if entropy_penalty != 1.0:
+                    penalty = penalty.pow(entropy_penalty)
+                penalty = penalty.clamp(min=1e-6)
+                scores = scores * penalty
+
+        coverage_mask = torch.zeros_like(scores, dtype=torch.bool)
+        coverage_reserved = 0
+        if coverage_topk > 0 and per_class_infos:
+            for info in per_class_infos:
+                feature_scores = info['feature_scores']
+                if feature_scores.numel() == 0:
+                    continue
+                k = min(coverage_topk, feature_scores.numel())
+                if k <= 0:
+                    continue
+                _, indices = torch.topk(feature_scores, k=k, sorted=False)
+                coverage_mask[indices] = True
+            coverage_mask = coverage_mask & alive_mask
+            if torch.any(coverage_mask):
+                base_values = scores[~coverage_mask]
+                if base_values.numel() > 0:
+                    max_value = base_values.max().item()
+                    boost_value = float(max_value + abs(max_value) + 1.0)
+                else:
+                    boost_value = 1.0
+                scores = scores.clone()
+                scores[coverage_mask] = boost_value
+                coverage_reserved = int(coverage_mask.sum().item())
+
+        eligible_mask = alive_mask & ~coverage_mask
+        eligible_scores = scores[eligible_mask]
+        if eligible_scores.numel() == 0:
+            if coverage_reserved > 0:
+                print(f'Group {group.name}: all neurons reserved by coverage constraint; skipping pruning.')
             continue
 
-        records.append((group, scores, alive_mask, alive_scores))
+        records.append((group, scores, alive_mask, eligible_mask, eligible_scores, coverage_reserved))
         if global_threshold:
-            global_scores.append(alive_scores)
+            global_scores.append(eligible_scores)
 
     if not records:
         print('No layers eligible for NeuronRank (NeuronRank inspired) pruning. Skipping.')
@@ -593,35 +910,37 @@ def _prune_neuron_groups_by_neuronrank(
                 f'(std {score_std} * sensitivity {sensitivity}): {threshold_value}'
             )
 
-        for group, scores, alive_mask, _ in records:
-            prune_mask = alive_mask & (scores < threshold_value)
+        for group, scores, alive_mask, eligible_mask, _, coverage_reserved in records:
+            prune_mask = eligible_mask & (scores < threshold_value)
             pruned = int(prune_mask.sum().item())
-            total = int(alive_mask.sum().item())
+            total = int(eligible_mask.sum().item())
+            extra = f' (coverage reserved {coverage_reserved})' if coverage_reserved else ''
             print(
                 f'Group {group.name}: pruning {pruned}/{total} neurons using '
-                f'global NeuronRank (NeuronRank inspired) threshold {threshold_value}'
+                f'global NeuronRank (NeuronRank inspired) threshold {threshold_value}{extra}'
             )
             _apply_neuron_pruning(group, prune_mask)
         return
 
-    for group, scores, alive_mask, alive_scores in records:
+    for group, scores, alive_mask, eligible_mask, eligible_scores, coverage_reserved in records:
         if percentile is not None:
-            threshold_value = float(np.percentile(alive_scores.detach().cpu().numpy(), percentile))
+            threshold_value = float(np.percentile(eligible_scores.detach().cpu().numpy(), percentile))
             print(
                 f'Group {group.name}: NeuronRank (NeuronRank inspired) pruning '
                 f'threshold (percentile {percentile}): {threshold_value}'
             )
         else:
-            score_std = alive_scores.std(unbiased=False).item()
+            score_std = eligible_scores.std(unbiased=False).item()
             threshold_value = score_std * sensitivity
             print(
                 f'Group {group.name}: NeuronRank (NeuronRank inspired) pruning '
                 f'threshold (std {score_std} * sensitivity {sensitivity}): {threshold_value}'
             )
 
-        prune_mask = alive_mask & (scores < threshold_value)
+        prune_mask = eligible_mask & (scores < threshold_value)
         pruned = int(prune_mask.sum().item())
-        total = int(alive_mask.sum().item())
-        print(f'Group {group.name}: pruning {pruned}/{total} neurons using NeuronRank (NeuronRank inspired) scores')
+        total = int(eligible_mask.sum().item())
+        extra = f' (coverage reserved {coverage_reserved})' if coverage_reserved else ''
+        print(f'Group {group.name}: pruning {pruned}/{total} neurons using NeuronRank (NeuronRank inspired) scores{extra}')
         _apply_neuron_pruning(group, prune_mask)
 
