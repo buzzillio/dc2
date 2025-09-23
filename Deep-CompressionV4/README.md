@@ -150,6 +150,27 @@ Plots now show perplexity vs compression when `--model gpt2` is selected and sum
 print the same metric. Use `--gpt2-max-eval-batches` to keep turnaround short when
 experimenting on CPU or limited hardware.
 
+#### Gradient-aware NeuronRank for GPT-style models
+
+NeuronRank now collects activation *and* gradient statistics when `--neuronrank-gradients`
+is set to `on` (the default `auto` mode enables it automatically for GPT-2/NanoGPT).
+Gradient magnitudes act as a contextual rarity signal—rare-but-impactful neurons receive
+larger scores—so pruning focuses on redundant units instead of those steering perplexity.
+
+Key knobs:
+
+- `--neuronrank-grad-threshold`: sets the minimum gradient magnitude counted in the
+  gradient document frequency (defaults to `1e-3`).
+- `--neuronrank-grad-mix`: blends the classic TF-IDF scores with the new gradient-aware
+  component. `0` disables gradients, `1` trusts them fully (default `0.75`).
+- `--neuronrank-grad-tf-power`, `--neuronrank-grad-idf-power`, and
+  `--neuronrank-grad-power`: shape the influence of the gradient activation, specificity,
+  and blended score respectively.
+
+These additions significantly tighten perplexity after pruning on language models while
+retaining backwards compatibility—existing activation stats keep working, and CNN workflows
+stay untouched unless you opt in.
+
 ### Weight sharing
 ``` bash
 $ python weight_share.py saves/model_after_retraining.ptmodel

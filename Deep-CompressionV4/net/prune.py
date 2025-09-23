@@ -117,6 +117,70 @@ def _build_weight_tfidf_components(
     return TFIDFComponents(tf_component=tf_component, idf_component=idf_component, feature_scores=feature_scores, axis=axis)
 
 
+def _compute_gradient_components(
+    stats: Dict,
+    *,
+    grad_tf_power: float,
+    grad_idf_power: float,
+    grad_smooth: float,
+    normalise_doc_freq: bool,
+) -> Optional[torch.Tensor]:
+    if stats is None:
+        return None
+
+    mean_abs_gradient = stats.get('mean_abs_gradient')
+    grad_doc_freq = stats.get('grad_doc_freq')
+    if mean_abs_gradient is None or grad_doc_freq is None:
+        return None
+
+    sample_count = int(stats.get('grad_sample_count', stats.get('sample_count', 0)))
+    if sample_count <= 0:
+        return None
+
+    gradient_tf = mean_abs_gradient.to(torch.float32).clamp(min=0.0).pow(grad_tf_power)
+    grad_doc_freq = grad_doc_freq.to(torch.float32)
+
+    smooth = grad_smooth if grad_smooth > 0 else 0.0
+    if normalise_doc_freq and sample_count > 0:
+        doc_component = (grad_doc_freq / float(sample_count)).clamp(min=0.0, max=1.0)
+        numerator_value = 1.0 + smooth + EPS
+        denominator = doc_component + smooth + EPS
+    else:
+        numerator_value = float(sample_count) + smooth + EPS
+        denominator = grad_doc_freq + smooth + EPS
+
+    numerator = torch.tensor(numerator_value, dtype=torch.float32, device=gradient_tf.device)
+    denominator = denominator.to(device=gradient_tf.device, dtype=torch.float32)
+    grad_idf = torch.log(numerator / denominator).clamp(min=0.0).pow(grad_idf_power)
+
+    return gradient_tf * grad_idf
+
+
+def _apply_gradient_blend(
+    scores: torch.Tensor,
+    gradient_component: Optional[torch.Tensor],
+    *,
+    mix: float,
+    power: float,
+) -> torch.Tensor:
+    if gradient_component is None or gradient_component.numel() == 0 or mix <= 0:
+        return scores
+
+    gradient_component = gradient_component.to(device=scores.device, dtype=scores.dtype)
+    gradient_component = gradient_component.clamp(min=0.0)
+    if power != 1.0:
+        gradient_component = gradient_component.pow(power)
+
+    mean_value = float(gradient_component.mean().item()) if gradient_component.numel() > 0 else 0.0
+    if mean_value <= EPS:
+        return scores
+
+    gradient_component = gradient_component / (mean_value + EPS)
+    mix = max(0.0, min(1.0, float(mix)))
+    blend = (1.0 - mix) + mix * gradient_component
+    return scores * blend
+
+
 def _mark_coverage(mask: torch.Tensor, axis: str, indices: torch.Tensor) -> None:
     if indices.numel() == 0:
         return
@@ -212,6 +276,12 @@ class PruningModule(Module):
         coverage_topk: int = 0,
         entropy_penalty: float = 0.0,
         class_normalise_doc_freq: bool = True,
+        grad_smooth: float = 1.0,
+        grad_tf_power: float = 1.0,
+        grad_idf_power: float = 1.0,
+        grad_power: float = 1.0,
+        grad_mix: float = 0.75,
+        grad_normalise_doc_freq: bool = True,
     ):
         """Prune connections using a NeuronRank (NeuronRank inspired) inspired score.
 
@@ -245,6 +315,14 @@ class PruningModule(Module):
                 neurons that activate uniformly across classes. 0 disables it.
             class_normalise_doc_freq (bool): If ``True`` normalise per-class document
                 frequencies by their sample counts during IDF computation.
+            grad_smooth (float): Smoothing value applied to gradient-driven IDF terms.
+            grad_tf_power (float): Exponent applied to the mean gradient magnitude.
+            grad_idf_power (float): Exponent applied to the gradient-based IDF term.
+            grad_power (float): Exponent applied to the blended gradient specificity score.
+            grad_mix (float): Blend factor between classic TF-IDF and gradient-aware
+                NeuronRank components (0 disables gradients, 1 uses gradients fully).
+            grad_normalise_doc_freq (bool): If ``True`` normalise gradient document
+                frequencies by sample counts when computing the gradient IDF term.
         """
 
         neuron_groups = self._neuron_pruning_groups()
@@ -264,6 +342,12 @@ class PruningModule(Module):
                 coverage_topk=coverage_topk,
                 entropy_penalty=entropy_penalty,
                 class_normalise_doc_freq=class_normalise_doc_freq,
+                grad_smooth=grad_smooth,
+                grad_tf_power=grad_tf_power,
+                grad_idf_power=grad_idf_power,
+                grad_power=grad_power,
+                grad_mix=grad_mix,
+                grad_normalise_doc_freq=grad_normalise_doc_freq,
             )
             return
 
@@ -307,6 +391,23 @@ class PruningModule(Module):
                 continue
 
             scores = weight_component * components.tf_component * components.idf_component
+
+            gradient_vector = _compute_gradient_components(
+                global_stats,
+                grad_tf_power=grad_tf_power,
+                grad_idf_power=grad_idf_power,
+                grad_smooth=grad_smooth,
+                normalise_doc_freq=grad_normalise_doc_freq,
+            )
+            if gradient_vector is not None:
+                grad_component = _reshape_for_axis(gradient_vector, weight, components.axis)
+                grad_component = grad_component.to(device=scores.device, dtype=scores.dtype)
+                scores = _apply_gradient_blend(
+                    scores,
+                    grad_component,
+                    mix=grad_mix,
+                    power=grad_power,
+                )
 
             need_class_stats = (
                 class_aggregation != 'pooled'
@@ -741,6 +842,12 @@ def _prune_neuron_groups_by_neuronrank(
     coverage_topk: int,
     entropy_penalty: float,
     class_normalise_doc_freq: bool,
+    grad_smooth: float,
+    grad_tf_power: float,
+    grad_idf_power: float,
+    grad_power: float,
+    grad_mix: float,
+    grad_normalise_doc_freq: bool,
 ) -> None:
     """Neuron-level NeuronRank pruning for supported models."""
 
@@ -787,6 +894,22 @@ def _prune_neuron_groups_by_neuronrank(
         idf_component = idf_vector.to(device=device, dtype=torch.float32)
 
         scores = base_scores * tf_component * idf_component
+
+        gradient_vector = _compute_gradient_components(
+            global_stats,
+            grad_tf_power=grad_tf_power,
+            grad_idf_power=grad_idf_power,
+            grad_smooth=grad_smooth,
+            normalise_doc_freq=grad_normalise_doc_freq,
+        )
+        if gradient_vector is not None:
+            gradient_vector = gradient_vector.to(device=device, dtype=torch.float32)
+        scores = _apply_gradient_blend(
+            scores,
+            gradient_vector,
+            mix=grad_mix,
+            power=grad_power,
+        )
 
         alive_mask = _neuron_alive_mask(group).to(device)
         if not torch.any(alive_mask):

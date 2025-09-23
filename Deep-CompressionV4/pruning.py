@@ -166,6 +166,28 @@ def build_parser() -> argparse.ArgumentParser:
                         dest='neuronrank_class_normalise', help=argparse.SUPPRESS)
     parser.set_defaults(neuronrank_class_normalise=True)
 
+    parser.add_argument('--neuronrank-gradients', choices=['auto', 'on', 'off'], default='auto',
+                        dest='neuronrank_gradients',
+                        help='collect gradient-aware NeuronRank statistics (auto enables them for GPT-style models)')
+    parser.add_argument('--neuronrank-grad-threshold', type=float, default=1e-3,
+                        dest='neuronrank_grad_threshold',
+                        help='gradient magnitude threshold for counting gradient document frequency (default: 1e-3)')
+    parser.add_argument('--neuronrank-grad-smooth', type=float, default=1.0,
+                        dest='neuronrank_grad_smooth',
+                        help='smoothing value for gradient-based IDF computation')
+    parser.add_argument('--neuronrank-grad-tf-power', type=float, default=1.0,
+                        dest='neuronrank_grad_tf_power',
+                        help='exponent applied to mean gradient magnitude when forming the gradient component')
+    parser.add_argument('--neuronrank-grad-idf-power', type=float, default=1.0,
+                        dest='neuronrank_grad_idf_power',
+                        help='exponent applied to the gradient-based IDF term')
+    parser.add_argument('--neuronrank-grad-power', type=float, default=1.0,
+                        dest='neuronrank_grad_power',
+                        help='exponent applied to the blended gradient specificity score')
+    parser.add_argument('--neuronrank-grad-mix', type=float, default=0.75,
+                        dest='neuronrank_grad_mix',
+                        help='blend ratio between classic NeuronRank and the gradient-aware component (0 disables gradients)')
+
     # Hidden aliases for legacy TF-IDF flags
     parser.add_argument('--tfidf-activation-threshold', type=float,
                         dest='neuronrank_activation_threshold', help=argparse.SUPPRESS)
@@ -196,6 +218,20 @@ def build_parser() -> argparse.ArgumentParser:
 def maybe_log(message: str) -> None:
     if args is not None and args.log:
         util.log(args.log, message)
+
+
+def neuronrank_should_use_gradients() -> bool:
+    """Determine whether gradient-aware statistics should be collected."""
+
+    if args is None:
+        return False
+
+    mode = getattr(args, 'neuronrank_gradients', 'auto')
+    if mode == 'on':
+        return True
+    if mode == 'off':
+        return False
+    return args.model in ('gpt2', 'nanogpt')
 
 
 def evaluation_metric_key() -> str:
@@ -610,19 +646,47 @@ def collect_activation_statistics(
     data_loader,
     activation_threshold=0.05,
     max_batches: Optional[int] = None,
+    include_gradients: Optional[bool] = None,
+    gradient_threshold: float = 0.0,
 ) -> Dict:
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     handles = []
 
     is_language_model = args.model in ('gpt2', 'nanogpt')
+    use_gradients = neuronrank_should_use_gradients() if include_gradients is None else include_gradients
+    grad_threshold = max(0.0, float(gradient_threshold))
     current_targets: Optional[torch.Tensor] = None
 
+    def collapse_tensor(tensor: torch.Tensor, take_abs: bool = True) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        working = tensor.abs() if take_abs else tensor
+        if is_language_model and working.dim() >= 3:
+            reduced = working.mean(dim=1)
+        elif working.dim() > 2:
+            reduce_dims = tuple(range(2, working.dim()))
+            reduced = working.mean(dim=reduce_dims)
+        else:
+            reduced = working
+        if reduced.dim() == 1:
+            reduced = reduced.unsqueeze(0)
+        return reduced
+
     def init_stat_vector(feature_count: int):
-        return {
+        base = {
             'sum_abs_activation': torch.zeros(feature_count, dtype=torch.float32),
             'doc_freq': torch.zeros(feature_count, dtype=torch.float32),
             'sample_count': 0,
         }
+        if use_gradients:
+            base.update(
+                {
+                    'sum_abs_gradient': torch.zeros(feature_count, dtype=torch.float32),
+                    'grad_doc_freq': torch.zeros(feature_count, dtype=torch.float32),
+                    'grad_sample_count': 0,
+                }
+            )
+        return base
 
     for name, module in mdl.named_modules():
         if not hasattr(module, 'mask'):
@@ -635,17 +699,11 @@ def collect_activation_statistics(
                 features = inputs[0]
                 if features is None:
                     return
-                features = features.detach()
-                if is_language_model and features.dim() >= 3:
-                    flattened = features.abs().mean(dim=1)
-                elif features.dim() > 2:
-                    reduce_dims = tuple(range(2, features.dim()))
-                    flattened = features.abs().mean(dim=reduce_dims)
-                else:
-                    flattened = features.abs()
-                if flattened.dim() == 1:
-                    flattened = flattened.unsqueeze(0)
-                flattened = flattened.to(dtype=torch.float32, device='cpu')
+
+                collapsed = collapse_tensor(features.detach(), take_abs=True)
+                if collapsed is None:
+                    return
+                flattened = collapsed.to(dtype=torch.float32, device='cpu')
                 present = (flattened > activation_threshold).to(dtype=torch.float32)
 
                 feature_count = flattened.size(1)
@@ -661,6 +719,25 @@ def collect_activation_statistics(
                 global_stats['sum_abs_activation'] += flattened.sum(dim=0)
                 global_stats['doc_freq'] += present.sum(dim=0)
                 global_stats['sample_count'] += flattened.size(0)
+
+                if use_gradients and features.requires_grad:
+                    def grad_hook(grad):
+                        if grad is None:
+                            return
+                        with torch.no_grad():
+                            grad_collapsed = collapse_tensor(grad, take_abs=True)
+                            if grad_collapsed is None:
+                                return
+                            grad_flat = grad_collapsed.to(dtype=torch.float32, device='cpu')
+                            if grad_flat.dim() == 1:
+                                grad_flat = grad_flat.unsqueeze(0)
+                            grad_present = (grad_flat > grad_threshold).to(dtype=torch.float32)
+                            grad_stats = layer_stats['global']
+                            grad_stats['sum_abs_gradient'] += grad_flat.sum(dim=0)
+                            grad_stats['grad_doc_freq'] += grad_present.sum(dim=0)
+                            grad_stats['grad_sample_count'] += grad_flat.size(0)
+
+                    features.register_hook(grad_hook)
 
                 targets = current_targets
                 if targets is None:
@@ -730,29 +807,60 @@ def collect_activation_statistics(
     was_training = mdl.training
     mdl.eval()
     processed_samples = 0
-    with torch.no_grad():
+
+    grad_context = torch.enable_grad() if use_gradients else torch.no_grad()
+    loss_fn = None
+    if use_gradients and not is_language_model:
+        loss_fn = criterion if criterion is not None else eval_criterion
+        if loss_fn is None:
+            raise RuntimeError('Cannot collect gradient-aware statistics without a loss function.')
+
+    with grad_context:
         for batch_idx, batch in enumerate(data_iterable):
             if max_batches is not None and batch_idx >= max_batches:
                 break
+
+            if use_gradients:
+                mdl.zero_grad(set_to_none=True)
+
             if is_language_model:
                 current_targets = None
-                inputs = {
-                    key: value.to(device, non_blocking=non_blocking)
-                    for key, value in batch.items()
-                    if key != 'labels'
-                }
                 processed_samples += batch['input_ids'].size(0)
-                mdl(**inputs)
+                if use_gradients:
+                    inputs = {
+                        key: value.to(device, non_blocking=non_blocking)
+                        for key, value in batch.items()
+                    }
+                    outputs = mdl(**inputs)
+                    loss = outputs.loss
+                    if loss is None:
+                        raise RuntimeError('Language model forward pass did not return a loss value.')
+                    loss.backward()
+                else:
+                    inputs = {
+                        key: value.to(device, non_blocking=non_blocking)
+                        for key, value in batch.items()
+                        if key != 'labels'
+                    }
+                    mdl(**inputs)
             else:
                 data, _target = batch
                 data = data.to(device, non_blocking=non_blocking)
                 if isinstance(_target, torch.Tensor):
+                    target_tensor = _target.to(device, non_blocking=non_blocking)
                     current_targets = _target.detach().to(device='cpu')
                 else:
+                    target_tensor = torch.as_tensor(_target, dtype=torch.long, device=device)
                     current_targets = torch.as_tensor(_target, dtype=torch.long)
                 processed_samples += data.size(0)
-                mdl(data)
+                outputs = mdl(data)
+                if use_gradients:
+                    loss = loss_fn(outputs, target_tensor)
+                    loss.backward()
                 current_targets = None
+
+            if use_gradients:
+                mdl.zero_grad(set_to_none=True)
 
     for handle in handles:
         handle.remove()
@@ -771,6 +879,24 @@ def collect_activation_statistics(
         global_stats['doc_freq'] = global_stats['doc_freq'].clamp_(min=0.0, max=float(count))
         del global_stats['sum_abs_activation']
 
+        if use_gradients and 'sum_abs_gradient' in global_stats:
+            grad_count = int(global_stats.get('grad_sample_count', 0))
+            if grad_count > 0:
+                mean_gradient = global_stats['sum_abs_gradient'] / grad_count
+            else:
+                mean_gradient = torch.zeros_like(global_stats['sum_abs_gradient'])
+            global_stats['mean_abs_gradient'] = mean_gradient
+            global_stats['grad_doc_freq'] = global_stats['grad_doc_freq'].clamp_(
+                min=0.0,
+                max=float(grad_count),
+            )
+            global_stats['grad_sample_count'] = grad_count
+            del global_stats['sum_abs_gradient']
+        else:
+            global_stats.pop('sum_abs_gradient', None)
+            global_stats.pop('grad_doc_freq', None)
+            global_stats.pop('grad_sample_count', None)
+
         per_class_stats = layer_stats.get('per_class', {})
         for class_id, class_stats in per_class_stats.items():
             class_count = int(class_stats.get('sample_count', 0))
@@ -783,16 +909,24 @@ def collect_activation_statistics(
                 min=0.0,
                 max=float(class_count),
             )
-            del class_stats['sum_abs_activation']
+            class_stats.pop('sum_abs_activation', None)
+            class_stats.pop('sum_abs_gradient', None)
+            class_stats.pop('grad_doc_freq', None)
+            class_stats.pop('grad_sample_count', None)
             per_class_stats[class_id] = class_stats
 
         layer_stats['per_class'] = per_class_stats
         layer_stats['global'] = global_stats
-        layer_stats['mean_abs_activation'] = global_stats['mean_abs_activation']
-        layer_stats['doc_freq'] = global_stats['doc_freq']
+        layer_stats['mean_abs_activation'] = global_stats.get('mean_abs_activation')
+        layer_stats['doc_freq'] = global_stats.get('doc_freq')
         layer_stats['sample_count'] = count
+        if use_gradients and 'mean_abs_gradient' in global_stats:
+            layer_stats['mean_abs_gradient'] = global_stats['mean_abs_gradient']
+            layer_stats['grad_doc_freq'] = global_stats['grad_doc_freq']
+            layer_stats['grad_sample_count'] = global_stats['grad_sample_count']
 
-    print(f'Collected activation statistics from {processed_samples} samples for NeuronRank pruning.')
+    label = 'activation statistics' if not use_gradients else 'activation/gradient statistics'
+    print(f'Collected {label} from {processed_samples} samples for NeuronRank pruning.')
     return stats
 
 
@@ -862,6 +996,8 @@ def execute_training_phase(
             train_loader,
             activation_threshold=args.neuronrank_activation_threshold,
             max_batches=args.neuronrank_max_batches,
+            include_gradients=neuronrank_should_use_gradients(),
+            gradient_threshold=args.neuronrank_grad_threshold,
         )
         if args.save_activation_stats:
             torch.save(stats, args.save_activation_stats)
@@ -884,6 +1020,8 @@ def ensure_activation_stats(stats: Optional[Dict]) -> Dict:
         train_loader,
         activation_threshold=args.neuronrank_activation_threshold,
         max_batches=args.neuronrank_max_batches,
+        include_gradients=neuronrank_should_use_gradients(),
+        gradient_threshold=args.neuronrank_grad_threshold,
     )
     if args.save_activation_stats:
         torch.save(collected, args.save_activation_stats)
@@ -933,6 +1071,12 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
             coverage_topk=args.neuronrank_coverage_topk,
             entropy_penalty=args.neuronrank_entropy_penalty,
             class_normalise_doc_freq=args.neuronrank_class_normalise,
+            grad_smooth=args.neuronrank_grad_smooth,
+            grad_tf_power=args.neuronrank_grad_tf_power,
+            grad_idf_power=args.neuronrank_grad_idf_power,
+            grad_power=args.neuronrank_grad_power,
+            grad_mix=args.neuronrank_grad_mix,
+            grad_normalise_doc_freq=args.neuronrank_class_normalise,
         )
     else:
         if target_percentile is not None:
