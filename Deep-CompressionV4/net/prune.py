@@ -656,6 +656,63 @@ class MaskedLinear(Module):
         self.weight.data.mul_(self.mask.data)
 
 
+class MaskedEmbedding(nn.Embedding):
+    """Embedding layer equipped with a pruning mask."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, **kwargs) -> None:
+        super().__init__(num_embeddings, embedding_dim, **kwargs)
+        mask = torch.ones_like(self.weight)
+        self.mask = Parameter(mask, requires_grad=False)
+
+    def forward(self, input):
+        masked_weight = self.weight * self.mask
+        return F.embedding(
+            input,
+            masked_weight,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+
+    def prune(self, threshold):
+        with torch.no_grad():
+            threshold_tensor = torch.as_tensor(
+                threshold,
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            )
+            zero_mask = torch.zeros_like(self.mask)
+            new_mask = torch.where(
+                self.weight.abs() < threshold_tensor,
+                zero_mask,
+                self.mask,
+            )
+            self.apply_new_mask(new_mask)
+
+    def prune_with_scores(self, scores, threshold):
+        with torch.no_grad():
+            score_tensor = scores.to(self.weight.device, dtype=self.weight.dtype)
+            threshold_tensor = torch.as_tensor(
+                threshold,
+                dtype=score_tensor.dtype,
+                device=score_tensor.device,
+            )
+            zero_mask = torch.zeros_like(self.mask)
+            new_mask = torch.where(
+                (score_tensor < threshold_tensor) & (self.mask > 0),
+                zero_mask,
+                self.mask,
+            )
+            self.apply_new_mask(new_mask)
+
+    def apply_new_mask(self, new_mask):
+        new_mask = new_mask.to(dtype=self.mask.dtype, device=self.mask.device)
+        self.mask.data.copy_(new_mask)
+        self.weight.data.mul_(self.mask.data)
+
+
 @dataclass
 class NeuronPruningGroup:
     """Represents a coupled pair of linear layers sharing a hidden neuron."""
