@@ -837,16 +837,83 @@ def load_checkpoint(path: str) -> Dict:
     return checkpoint
 
 
+def _derive_bias_mask(module: nn.Module) -> Optional[torch.Tensor]:
+    """Return a 0/1 mask for a module's bias based on its weight mask."""
+
+    mask = getattr(module, 'mask', None)
+    bias = getattr(module, 'bias', None)
+    if mask is None or bias is None:
+        return None
+
+    num_bias = bias.numel()
+    if num_bias == 0:
+        return None
+
+    # Linear and convolutional layers store output channels along either the
+    # first or the last dimension depending on implementation details.
+    if mask.dim() == 1 and mask.size(0) == num_bias:
+        active = mask.abs()
+    elif mask.size(0) == num_bias:
+        reduce_dims = tuple(range(1, mask.dim()))
+        active = mask.abs().sum(dim=reduce_dims)
+    elif mask.size(-1) == num_bias:
+        reduce_dims = tuple(range(0, mask.dim() - 1))
+        active = mask.abs().sum(dim=reduce_dims)
+    else:
+        try:
+            active = mask.reshape(num_bias, -1).abs().sum(dim=1)
+        except RuntimeError:
+            return None
+
+    bias_mask = (active > 0).to(device=bias.device, dtype=bias.dtype)
+    return bias_mask.detach()
+
+
 def build_weight_mask_map(mdl: nn.Module) -> Dict[str, torch.Tensor]:
     mapping = {}
     for module_name, module in mdl.named_modules():
         mask = getattr(module, 'mask', None)
         if mask is None:
             continue
+
+        prefix = f'{module_name}.' if module_name else ''
         if hasattr(module, 'weight'):
-            param_name = f'{module_name}.weight' if module_name else 'weight'
-            mapping[param_name] = mask
+            mapping[f'{prefix}weight'] = mask
+
+        bias_mask = _derive_bias_mask(module)
+        if bias_mask is not None:
+            mapping[f'{prefix}bias'] = bias_mask
+
     return mapping
+
+
+def apply_masks_to_parameters(
+    mdl: nn.Module,
+    masks: Dict[str, torch.Tensor],
+    optimizer: Optional[optim.Optimizer] = None,
+) -> None:
+    """Clamp pruned parameters (and optimizer state) to zero."""
+
+    if not masks:
+        return
+
+    for name, param in mdl.named_parameters():
+        mask = masks.get(name)
+        if mask is None:
+            continue
+
+        mask_tensor = mask.to(device=param.data.device, dtype=param.data.dtype)
+        param.data.mul_(mask_tensor)
+
+        if optimizer is None:
+            continue
+
+        state = optimizer.state.get(param)
+        if not state:
+            continue
+        for value in state.values():
+            if torch.is_tensor(value) and value.shape == param.data.shape:
+                value.mul_(mask_tensor)
 
 
 def create_optimizer():
@@ -881,6 +948,7 @@ def train_model(
 
     baseline_alive = None
     if mask_grad:
+        apply_masks_to_parameters(model, weight_masks)
         baseline_alive = util.collect_nonzero_stats(model)['alive']
 
     for epoch in range(epochs):
@@ -917,6 +985,9 @@ def train_model(
                         param.grad.mul_(mask)
 
             optimizer.step()
+
+            if mask_grad and weight_masks:
+                apply_masks_to_parameters(model, weight_masks, optimizer)
 
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
@@ -1544,6 +1615,7 @@ def load_model_for_pruning(checkpoint_path: str):
     if eval_criterion is not None:
         eval_criterion.to(device)
     weight_masks = build_weight_mask_map(model)
+    apply_masks_to_parameters(model, weight_masks)
     return checkpoint
 
 
@@ -1691,6 +1763,9 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
         else:
             model.prune_by_std(args.sensitivity, **prune_kwargs)
 
+    weight_masks = build_weight_mask_map(model)
+    apply_masks_to_parameters(model, weight_masks)
+
     sparsity_stats = util.collect_nonzero_stats(model)
     eval_after_pruning = evaluate_model()
     maybe_log_metric('after_pruning', eval_after_pruning)
@@ -1705,6 +1780,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
     if retrain_epochs and retrain_epochs > 0:
         print('--- Retraining ---')
         weight_masks = build_weight_mask_map(model)
+        apply_masks_to_parameters(model, weight_masks)
         optimizer = create_optimizer()
         retrain_time_info = train_model(
             retrain_epochs,
