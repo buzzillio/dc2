@@ -837,15 +837,53 @@ def load_checkpoint(path: str) -> Dict:
     return checkpoint
 
 
+def _derive_bias_mask(module: nn.Module) -> Optional[torch.Tensor]:
+    """Return a 0/1 mask for a module's bias based on its weight mask."""
+
+    mask = getattr(module, 'mask', None)
+    bias = getattr(module, 'bias', None)
+    if mask is None or bias is None:
+        return None
+
+    num_bias = bias.numel()
+    if num_bias == 0:
+        return None
+
+    # Linear and convolutional layers store output channels along either the
+    # first or the last dimension depending on implementation details.
+    if mask.dim() == 1 and mask.size(0) == num_bias:
+        active = mask.abs()
+    elif mask.size(0) == num_bias:
+        reduce_dims = tuple(range(1, mask.dim()))
+        active = mask.abs().sum(dim=reduce_dims)
+    elif mask.size(-1) == num_bias:
+        reduce_dims = tuple(range(0, mask.dim() - 1))
+        active = mask.abs().sum(dim=reduce_dims)
+    else:
+        try:
+            active = mask.reshape(num_bias, -1).abs().sum(dim=1)
+        except RuntimeError:
+            return None
+
+    bias_mask = (active > 0).to(device=bias.device, dtype=bias.dtype)
+    return bias_mask.detach()
+
+
 def build_weight_mask_map(mdl: nn.Module) -> Dict[str, torch.Tensor]:
     mapping = {}
     for module_name, module in mdl.named_modules():
         mask = getattr(module, 'mask', None)
         if mask is None:
             continue
+
+        prefix = f'{module_name}.' if module_name else ''
         if hasattr(module, 'weight'):
-            param_name = f'{module_name}.weight' if module_name else 'weight'
-            mapping[param_name] = mask
+            mapping[f'{prefix}weight'] = mask
+
+        bias_mask = _derive_bias_mask(module)
+        if bias_mask is not None:
+            mapping[f'{prefix}bias'] = bias_mask
+
     return mapping
 
 
@@ -917,6 +955,19 @@ def train_model(
                         param.grad.mul_(mask)
 
             optimizer.step()
+
+            if mask_grad and weight_masks:
+                for name, param in model.named_parameters():
+                    mask = weight_masks.get(name)
+                    if mask is None:
+                        continue
+                    param.data.mul_(mask)
+                    state = optimizer.state.get(param)
+                    if not state:
+                        continue
+                    for value in state.values():
+                        if torch.is_tensor(value) and value.shape == param.data.shape:
+                            value.mul_(mask)
 
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
