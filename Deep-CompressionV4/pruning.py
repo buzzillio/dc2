@@ -392,43 +392,48 @@ def _collect_transformer_block_statistics(
                         if features is None:
                             return
                         with torch.no_grad():
-                            values = features.detach().to(dtype=torch.float32, device='cpu')
+                            values = features.detach().to(dtype=torch.float32)
                         if values.dim() < 2:
                             values = values.reshape(1, -1)
                         else:
                             values = values.reshape(-1, values.size(-1))
                         if values.size(1) != target_accum['norm_sum'].numel():
                             return
+
                         norms = torch.linalg.norm(values, dim=0)
-                        target_accum['norm_sum'] += norms
+                        target_accum['norm_sum'] += norms.to(device='cpu')
                         target_accum['batch_count'] += 1
                         target_accum['sample_count'] += int(values.size(0))
+
                         if values.size(0) > 0:
                             batch_quantile = torch.quantile(values, df_quantile, dim=0)
                             count = target_accum['batch_count']
+                            quantile_cpu = batch_quantile.to(device='cpu')
                             if count == 1:
-                                target_accum['threshold'] = batch_quantile
+                                target_accum['threshold'] = quantile_cpu
                             else:
                                 momentum = 1.0 / float(count)
-                                target_accum['threshold'] = target_accum['threshold'] + (
-                                    batch_quantile - target_accum['threshold']
-                                ) * momentum
-                            threshold = target_accum['threshold']
-                            target_accum['df_count'] += (values > threshold).sum(dim=0)
+                                target_accum['threshold'].lerp_(quantile_cpu, momentum)
+                            threshold_device = target_accum['threshold'].to(device=values.device)
+                            df_increment = (values > threshold_device).sum(dim=0)
+                            target_accum['df_count'] += df_increment.to(device='cpu')
 
                         if collect_gradients and features.requires_grad:
+
                             def grad_hook(grad):
                                 if grad is None:
                                     return
-                                grad_values = grad.detach().to(dtype=torch.float32, device='cpu')
-                                if grad_values.dim() < 2:
-                                    grad_values = grad_values.reshape(1, -1)
-                                else:
-                                    grad_values = grad_values.reshape(-1, grad_values.size(-1))
-                                if grad_values.size(1) != target_accum['grad_abs_sum'].numel():
-                                    return
-                                target_accum['grad_abs_sum'] += grad_values.abs().sum(dim=0)
-                                target_accum['grad_sample_count'] += int(grad_values.size(0))
+                                with torch.no_grad():
+                                    grad_values = grad.detach().to(dtype=torch.float32)
+                                    if grad_values.dim() < 2:
+                                        grad_values = grad_values.reshape(1, -1)
+                                    else:
+                                        grad_values = grad_values.reshape(-1, grad_values.size(-1))
+                                    if grad_values.size(1) != target_accum['grad_abs_sum'].numel():
+                                        return
+                                    grad_sum = grad_values.abs().sum(dim=0)
+                                    target_accum['grad_abs_sum'] += grad_sum.to(device='cpu')
+                                    target_accum['grad_sample_count'] += int(grad_values.size(0))
 
                             features.register_hook(grad_hook)
 
@@ -452,7 +457,7 @@ def _collect_transformer_block_statistics(
                         if attn_output is None:
                             return
                         with torch.no_grad():
-                            values = attn_output.detach().to(dtype=torch.float32, device='cpu')
+                            values = attn_output.detach().to(dtype=torch.float32)
                         last_dim = values.size(-1)
                         head_dim_eff = head_dim_local if head_dim_local and head_dim_local > 0 else None
                         if head_dim_eff is None or head_dim_eff * n_head_local != last_dim:
@@ -462,30 +467,31 @@ def _collect_transformer_block_statistics(
                                 return
                         reshaped = values.reshape(-1, n_head_local, head_dim_eff)
                         norms = torch.linalg.norm(reshaped, dim=-1)
-                        target_accum['norm_sum'] += norms.sum(dim=0)
+                        target_accum['norm_sum'] += norms.sum(dim=0).to(device='cpu')
                         target_accum['sample_count'] += int(norms.size(0))
                         target_accum['batch_count'] += 1
                         batch_quantile = torch.quantile(norms, df_quantile, dim=0)
                         count = target_accum['batch_count']
+                        quantile_cpu = batch_quantile.to(device='cpu')
                         if count == 1:
-                            target_accum['threshold'] = batch_quantile
+                            target_accum['threshold'] = quantile_cpu
                         else:
                             momentum = 1.0 / float(count)
-                            target_accum['threshold'] = target_accum['threshold'] + (
-                                batch_quantile - target_accum['threshold']
-                            ) * momentum
-                        threshold = target_accum['threshold']
-                        target_accum['df_count'] += (norms > threshold).sum(dim=0)
+                            target_accum['threshold'].lerp_(quantile_cpu, momentum)
+                        threshold_device = target_accum['threshold'].to(device=norms.device)
+                        target_accum['df_count'] += (norms > threshold_device).sum(dim=0).to(device='cpu')
 
                         if collect_gradients and attn_output.requires_grad:
+
                             def grad_hook(grad):
                                 if grad is None:
                                     return
-                                grad_values = grad.detach().to(dtype=torch.float32, device='cpu')
-                                grad_values = grad_values.reshape(-1, n_head_local, head_dim_eff)
-                                grad_norms = torch.linalg.norm(grad_values, dim=-1)
-                                target_accum['grad_norm_sum'] += grad_norms.sum(dim=0)
-                                target_accum['grad_sample_count'] += int(grad_norms.size(0))
+                                with torch.no_grad():
+                                    grad_values = grad.detach().to(dtype=torch.float32)
+                                    grad_values = grad_values.reshape(-1, n_head_local, head_dim_eff)
+                                    grad_norms = torch.linalg.norm(grad_values, dim=-1)
+                                    target_accum['grad_norm_sum'] += grad_norms.sum(dim=0).to(device='cpu')
+                                    target_accum['grad_sample_count'] += int(grad_norms.size(0))
 
                             attn_output.register_hook(grad_hook)
 
