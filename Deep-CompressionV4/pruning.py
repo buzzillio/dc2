@@ -918,6 +918,19 @@ def train_model(
 
             optimizer.step()
 
+            if mask_grad and weight_masks:
+                for name, param in model.named_parameters():
+                    mask = weight_masks.get(name)
+                    if mask is None:
+                        continue
+                    param.data.mul_(mask)
+                    state = optimizer.state.get(param)
+                    if not state:
+                        continue
+                    for value in state.values():
+                        if torch.is_tensor(value) and value.shape == param.data.shape:
+                            value.mul_(mask)
+
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
                 # Calculate actual samples processed (handle variable batch sizes correctly)
