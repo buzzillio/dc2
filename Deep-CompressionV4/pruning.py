@@ -123,9 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help='avoid writing checkpoints even when output paths provided')
 
     # NeuronRank hyperparameters (with TF-IDF aliases for backward compatibility)
-    parser.add_argument('--neuronrank-activation-threshold', type=float, default=0.05,
+    parser.add_argument('--neuronrank-activation-threshold', type=float, default=0.8,
                         dest='neuronrank_activation_threshold',
-                        help='activation threshold for document frequency counting')
+                        help='activation quantile (0-1) for document frequency counting; set >1 for an absolute threshold')
     parser.add_argument('--neuronrank-idf-smooth', type=float, default=1.0,
                         dest='neuronrank_idf_smooth',
                         help='smoothing value added to IDF numerator/denominator')
@@ -660,6 +660,109 @@ def collect_activation_statistics(
     grad_threshold = max(0.0, float(gradient_threshold))
     current_targets: Optional[torch.Tensor] = None
 
+    activation_threshold_value = float(activation_threshold)
+    use_quantile_threshold = 0.0 < activation_threshold_value < 1.0
+
+    model_num_heads: Optional[int] = None
+    model_config = getattr(mdl, 'config', None)
+    if model_config is not None:
+        for attr in ('n_head', 'num_attention_heads', 'num_heads'):
+            value = getattr(model_config, attr, None)
+            if value is not None:
+                model_num_heads = int(value)
+                break
+
+    name_to_module = dict(mdl.named_modules())
+
+    module_metadata: Dict[str, Dict[str, object]] = {}
+    alias_map: Dict[str, str] = {}
+
+    def ensure_metadata_entry(module_name: str) -> Dict[str, object]:
+        entry = module_metadata.get(module_name)
+        if entry is None:
+            entry = {
+                'axis': 'input',
+                'collect': True,
+                'alias': None,
+                'num_heads': None,
+                'head_canonical': False,
+            }
+            module_metadata[module_name] = entry
+        else:
+            entry.setdefault('axis', 'input')
+            entry.setdefault('collect', True)
+            entry.setdefault('alias', None)
+            entry.setdefault('num_heads', None)
+            entry.setdefault('head_canonical', False)
+        return entry
+
+    for module_name, module_obj in name_to_module.items():
+        if not hasattr(module_obj, 'mask'):
+            continue
+        info = ensure_metadata_entry(module_name)
+        if module_name.endswith('mlp.c_fc'):
+            info['axis'] = 'output'
+            partner = module_name[:-len('c_fc')] + 'c_proj'
+            partner_module = name_to_module.get(partner)
+            if partner_module is not None and hasattr(partner_module, 'mask'):
+                info['collect'] = False
+                info['alias'] = partner
+                alias_map[module_name] = partner
+                partner_info = ensure_metadata_entry(partner)
+                partner_info['axis'] = 'input'
+            continue
+        if module_name.endswith('mlp.c_proj'):
+            info['axis'] = 'input'
+            continue
+        if module_name.endswith('attn.c_proj'):
+            info['axis'] = 'input'
+            if model_num_heads is not None:
+                info['num_heads'] = int(model_num_heads)
+                info['head_canonical'] = True
+            partner = module_name[:-len('c_proj')] + 'c_attn'
+            partner_module = name_to_module.get(partner)
+            if partner_module is not None and hasattr(partner_module, 'mask'):
+                alias_map[partner] = module_name
+                partner_info = ensure_metadata_entry(partner)
+                partner_info['axis'] = 'output'
+                partner_info['collect'] = False
+                partner_info['alias'] = module_name
+                if model_num_heads is not None:
+                    partner_info['num_heads'] = int(model_num_heads)
+            continue
+        if module_name.endswith('attn.c_attn'):
+            info['axis'] = 'output'
+            if model_num_heads is not None:
+                info['num_heads'] = int(model_num_heads)
+            continue
+
+    def update_activation_counters(container: Dict[str, torch.Tensor], values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        values_cpu = values.detach().to(dtype=torch.float32, device='cpu')
+        if values_cpu.dim() == 1:
+            values_cpu = values_cpu.unsqueeze(0)
+        container['sum_abs_activation'] += values_cpu.sum(dim=0)
+        container['sample_count'] += values_cpu.size(0)
+        if use_quantile_threshold:
+            batch_quantile = torch.quantile(values_cpu, activation_threshold_value, dim=0)
+            running = container.get('running_threshold')
+            batches = int(container.get('threshold_batches', 0))
+            if running is None or running.numel() != batch_quantile.numel():
+                running = batch_quantile.clone()
+            else:
+                momentum = 1.0 / float(batches + 1)
+                running = running + (batch_quantile - running) * momentum
+            container['running_threshold'] = running
+            container['threshold_batches'] = batches + 1
+            threshold = running
+        else:
+            threshold = container.get('static_threshold')
+            if threshold is None or threshold.numel() != values_cpu.size(1):
+                threshold = torch.full((values_cpu.size(1),), activation_threshold_value, dtype=torch.float32)
+                container['static_threshold'] = threshold
+        present = (values_cpu > threshold).to(dtype=torch.float32)
+        container['doc_freq'] += present.sum(dim=0)
+        return values_cpu, present
+
     def collapse_tensor(tensor: torch.Tensor, take_abs: bool = True) -> Optional[torch.Tensor]:
         if tensor is None:
             return None
@@ -695,7 +798,24 @@ def collect_activation_statistics(
         if not hasattr(module, 'mask'):
             continue
 
-        def make_hook(layer_name):
+        meta = module_metadata.get(
+            name,
+            {
+                'axis': 'input',
+                'collect': True,
+                'alias': None,
+                'num_heads': None,
+                'head_canonical': False,
+            },
+        )
+        if not meta.get('collect', True):
+            continue
+
+        def make_hook(layer_name: str, info_dict: Dict[str, object]):
+            axis = info_dict.get('axis', 'input')
+            num_heads = info_dict.get('num_heads')
+            head_canonical = bool(info_dict.get('head_canonical', False))
+
             def hook(module_ref, inputs, output):
                 features = None
                 if isinstance(module_ref, nn.Embedding):
@@ -709,7 +829,8 @@ def collect_activation_statistics(
                 if collapsed is None:
                     return
                 flattened = collapsed.to(dtype=torch.float32, device='cpu')
-                present = (flattened > activation_threshold).to(dtype=torch.float32)
+                if flattened.dim() == 1:
+                    flattened = flattened.unsqueeze(0)
 
                 feature_count = flattened.size(1)
                 layer_stats = stats.setdefault(
@@ -719,11 +840,23 @@ def collect_activation_statistics(
                         'per_class': {},
                     },
                 )
+                layer_stats['axis'] = axis
+                if num_heads is not None:
+                    layer_stats.setdefault('num_heads', int(num_heads))
 
                 global_stats = layer_stats['global']
-                global_stats['sum_abs_activation'] += flattened.sum(dim=0)
-                global_stats['doc_freq'] += present.sum(dim=0)
-                global_stats['sample_count'] += flattened.size(0)
+                feature_values, _ = update_activation_counters(global_stats, flattened)
+
+                if head_canonical and num_heads and features.dim() >= 2:
+                    last_dim = features.size(-1)
+                    head_count = int(num_heads)
+                    if head_count > 0 and last_dim % head_count == 0:
+                        head_dim = last_dim // head_count
+                        head_values = features.detach().contiguous().view(-1, head_count, head_dim)
+                        head_norms = head_values.norm(p=2, dim=-1)
+                        head_stats = layer_stats.setdefault('head', init_stat_vector(head_count))
+                        head_stats.setdefault('axis', 'head')
+                        update_activation_counters(head_stats, head_norms)
 
                 if use_gradients and features.requires_grad:
                     def grad_hook(grad):
@@ -754,7 +887,7 @@ def collect_activation_statistics(
                 if targets.dim() == 0:
                     targets = targets.view(1)
 
-                if targets.numel() != flattened.size(0):
+                if targets.numel() != feature_values.size(0):
                     return
 
                 targets = targets.to(dtype=torch.long, device='cpu')
@@ -764,18 +897,18 @@ def collect_activation_statistics(
                     class_mask = targets == class_value
                     if not torch.any(class_mask):
                         continue
-                    class_count = int(class_mask.sum().item())
+                    class_values = feature_values[class_mask]
+                    if class_values.numel() == 0:
+                        continue
                     class_entry = per_class_stats.setdefault(
                         int(class_value),
                         init_stat_vector(feature_count),
                     )
-                    class_entry['sum_abs_activation'] += flattened[class_mask].sum(dim=0)
-                    class_entry['doc_freq'] += present[class_mask].sum(dim=0)
-                    class_entry['sample_count'] += class_count
+                    update_activation_counters(class_entry, class_values)
 
             return hook
 
-        handles.append(module.register_forward_hook(make_hook(name)))
+        handles.append(module.register_forward_hook(make_hook(name, meta)))
 
     if not handles:
         print('No masked layers found when collecting activation statistics.')
@@ -874,6 +1007,7 @@ def collect_activation_statistics(
         mdl.train()
 
     for layer_name, layer_stats in stats.items():
+        layer_axis = layer_stats.get('axis', 'input')
         global_stats = layer_stats.get('global', {})
         count = int(global_stats.get('sample_count', 0))
         if count > 0:
@@ -882,6 +1016,9 @@ def collect_activation_statistics(
             mean_activation = torch.zeros_like(global_stats['sum_abs_activation'])
         global_stats['mean_abs_activation'] = mean_activation
         global_stats['doc_freq'] = global_stats['doc_freq'].clamp_(min=0.0, max=float(count))
+        global_stats.pop('running_threshold', None)
+        global_stats.pop('threshold_batches', None)
+        global_stats.pop('static_threshold', None)
         del global_stats['sum_abs_activation']
 
         if use_gradients and 'sum_abs_gradient' in global_stats:
@@ -902,6 +1039,23 @@ def collect_activation_statistics(
             global_stats.pop('grad_doc_freq', None)
             global_stats.pop('grad_sample_count', None)
 
+        head_stats = layer_stats.get('head')
+        if head_stats:
+            head_count = int(head_stats.get('sample_count', 0))
+            if head_count > 0:
+                head_mean = head_stats['sum_abs_activation'] / head_count
+            else:
+                head_mean = torch.zeros_like(head_stats['sum_abs_activation'])
+            head_stats['mean_abs_activation'] = head_mean
+            head_stats['doc_freq'] = head_stats['doc_freq'].clamp_(
+                min=0.0,
+                max=float(head_count),
+            )
+            head_stats.pop('running_threshold', None)
+            head_stats.pop('threshold_batches', None)
+            head_stats.pop('static_threshold', None)
+            head_stats.pop('sum_abs_activation', None)
+
         per_class_stats = layer_stats.get('per_class', {})
         for class_id, class_stats in per_class_stats.items():
             class_count = int(class_stats.get('sample_count', 0))
@@ -914,12 +1068,16 @@ def collect_activation_statistics(
                 min=0.0,
                 max=float(class_count),
             )
+            class_stats.pop('running_threshold', None)
+            class_stats.pop('threshold_batches', None)
+            class_stats.pop('static_threshold', None)
             class_stats.pop('sum_abs_activation', None)
             class_stats.pop('sum_abs_gradient', None)
             class_stats.pop('grad_doc_freq', None)
             class_stats.pop('grad_sample_count', None)
             per_class_stats[class_id] = class_stats
 
+        layer_stats['axis'] = layer_axis
         layer_stats['per_class'] = per_class_stats
         layer_stats['global'] = global_stats
         layer_stats['mean_abs_activation'] = global_stats.get('mean_abs_activation')
@@ -929,6 +1087,30 @@ def collect_activation_statistics(
             layer_stats['mean_abs_gradient'] = global_stats['mean_abs_gradient']
             layer_stats['grad_doc_freq'] = global_stats['grad_doc_freq']
             layer_stats['grad_sample_count'] = global_stats['grad_sample_count']
+
+    for alias_name, canonical_name in alias_map.items():
+        canonical_stats = stats.get(canonical_name)
+        if not canonical_stats:
+            continue
+        alias_info = module_metadata.get(alias_name, {})
+        alias_entry = {
+            'global': canonical_stats.get('global'),
+            'per_class': canonical_stats.get('per_class', {}),
+            'mean_abs_activation': canonical_stats.get('mean_abs_activation'),
+            'doc_freq': canonical_stats.get('doc_freq'),
+            'sample_count': canonical_stats.get('sample_count'),
+            'axis': alias_info.get('axis', canonical_stats.get('axis', 'input')),
+        }
+        if 'head' in canonical_stats:
+            alias_entry['head'] = canonical_stats['head']
+        num_heads_value = alias_info.get('num_heads', canonical_stats.get('num_heads'))
+        if num_heads_value is not None:
+            alias_entry['num_heads'] = num_heads_value
+        if use_gradients and 'mean_abs_gradient' in canonical_stats:
+            alias_entry['mean_abs_gradient'] = canonical_stats.get('mean_abs_gradient')
+            alias_entry['grad_doc_freq'] = canonical_stats.get('grad_doc_freq')
+            alias_entry['grad_sample_count'] = canonical_stats.get('grad_sample_count')
+        stats[alias_name] = alias_entry
 
     label = 'activation statistics' if not use_gradients else 'activation/gradient statistics'
     print(f'Collected {label} from {processed_samples} samples for NeuronRank pruning.')

@@ -86,6 +86,50 @@ def _reshape_for_axis(vector: torch.Tensor, weight: torch.Tensor, axis: str) -> 
     return vector.reshape(shape)
 
 
+def _build_head_scale(
+    module_name: str,
+    weight: torch.Tensor,
+    head_scores: torch.Tensor,
+    num_heads: int,
+) -> Optional[torch.Tensor]:
+    if num_heads <= 0 or head_scores.numel() == 0:
+        return None
+
+    device = weight.device
+    dtype = torch.float32
+    scores = head_scores.to(dtype=dtype, device=device)
+    scale = torch.ones_like(weight, dtype=dtype)
+
+    if module_name.endswith('attn.c_attn'):
+        total_rows = weight.size(0)
+        if total_rows % 3 != 0:
+            return None
+        hidden = total_rows // 3
+        if hidden % num_heads != 0:
+            return None
+        head_dim = hidden // num_heads
+        for head_idx in range(num_heads):
+            value = float(scores[head_idx].item())
+            for block in range(3):
+                start = block * hidden + head_idx * head_dim
+                end = start + head_dim
+                scale[start:end, :] = scale[start:end, :] * value
+    elif module_name.endswith('attn.c_proj'):
+        total_cols = weight.size(1)
+        if total_cols % num_heads != 0:
+            return None
+        head_dim = total_cols // num_heads
+        for head_idx in range(num_heads):
+            value = float(scores[head_idx].item())
+            start = head_idx * head_dim
+            end = start + head_dim
+            scale[:, start:end] = scale[:, start:end] * value
+    else:
+        return None
+
+    return scale
+
+
 def _build_weight_tfidf_components(
     stats: Dict,
     weight: torch.Tensor,
@@ -95,6 +139,7 @@ def _build_weight_tfidf_components(
     idf_add: float,
     idf_smooth: float,
     normalise_doc_freq: bool,
+    axis_override: Optional[str] = None,
 ) -> Optional[TFIDFComponents]:
     base = _compute_tfidf_base(
         stats,
@@ -108,7 +153,10 @@ def _build_weight_tfidf_components(
         return None
 
     tf_vector, idf_vector, feature_scores = base
-    axis = _determine_feature_axis(weight, tf_vector.numel())
+    if axis_override in ('input', 'output'):
+        axis = axis_override
+    else:
+        axis = _determine_feature_axis(weight, tf_vector.numel())
     if axis is None:
         return None
 
@@ -394,6 +442,7 @@ class PruningModule(Module):
                 idf_add=idf_add,
                 idf_smooth=idf_smooth,
                 normalise_doc_freq=False,
+                axis_override=stats.get('axis'),
             )
             if components is None:
                 continue
@@ -418,6 +467,30 @@ class PruningModule(Module):
                     power=grad_power,
                 )
 
+            head_stats = stats.get('head')
+            num_heads_value = stats.get('num_heads')
+            if head_stats and num_heads_value:
+                head_components = _compute_tfidf_base(
+                    head_stats,
+                    tf_power=tf_power,
+                    idf_power=idf_power,
+                    idf_add=idf_add,
+                    idf_smooth=idf_smooth,
+                    normalise_doc_freq=False,
+                )
+                if head_components is not None:
+                    head_tf_vec, head_idf_vec, _ = head_components
+                    head_scores_vec = head_tf_vec * head_idf_vec
+                    head_scale = _build_head_scale(
+                        name,
+                        weight,
+                        head_scores_vec,
+                        int(num_heads_value),
+                    )
+                    if head_scale is not None:
+                        head_scale = head_scale.to(device=scores.device, dtype=scores.dtype)
+                        scores = scores * head_scale
+
             need_class_stats = (
                 class_aggregation != 'pooled'
                 or coverage_topk > 0
@@ -436,6 +509,7 @@ class PruningModule(Module):
                         idf_add=idf_add,
                         idf_smooth=idf_smooth,
                         normalise_doc_freq=class_normalise_doc_freq,
+                        axis_override=stats.get('axis'),
                     )
                     if class_components is None:
                         continue
