@@ -11,6 +11,8 @@ from torch.nn import Parameter
 from torch.nn.modules.module import Module
 import torch.nn.functional as F
 
+import util
+
 EPS = 1e-12
 
 
@@ -262,6 +264,33 @@ class PruningModule(Module):
             q (float): percentile in float
             **kwargs: may contain `cuda`
         """
+        activation_stats = kwargs.get('activation_stats')
+        structured_first = bool(kwargs.get('structured_first', False))
+        target_sparsity = kwargs.get('target_sparsity')
+        if structured_first and activation_stats and target_sparsity is not None:
+            transformer_groups = discover_transformer_groups(self)
+            if transformer_groups:
+                executed_structured = _structured_transformer_pruning(
+                    self,
+                    transformer_groups,
+                    activation_stats,
+                    target_sparsity=target_sparsity,
+                    structured_ratio=float(kwargs.get('structured_ratio', 0.6)),
+                    prune_attn_heads=kwargs.get('prune_attn_heads', True),
+                    prune_mlp_channels=kwargs.get('prune_mlp_channels', True),
+                    prune_embeddings=kwargs.get('prune_embeddings', False),
+                    prune_lm_head=kwargs.get('prune_lm_head', False),
+                    weight_power=float(kwargs.get('weight_power', 1.0)),
+                    tf_power=float(kwargs.get('tf_power', 1.0)),
+                    idf_power=float(kwargs.get('idf_power', 1.0)),
+                    idf_add=float(kwargs.get('idf_add', 1.0)),
+                    idf_smooth=float(kwargs.get('idf_smooth', 1.0)),
+                    grad_spice=float(kwargs.get('grad_spice', 0.0)),
+                    global_topk=bool(kwargs.get('global_topk', True)),
+                )
+                if executed_structured:
+                    return
+
         neuron_groups = self._neuron_pruning_groups()
         if neuron_groups:
             _prune_neuron_groups_by_percentile(neuron_groups, q)
@@ -289,7 +318,7 @@ class PruningModule(Module):
             if hasattr(module, 'mask'):
                 module.prune(threshold=percentile_value)
 
-    def prune_by_std(self, s=0.25):
+    def prune_by_std(self, s=0.25, **kwargs):
         """
         Note that `s` is a quality parameter / sensitivity value according to the paper.
         According to Song Han's previous paper (Learning both Weights and Connections for Efficient Neural Networks),
@@ -298,6 +327,33 @@ class PruningModule(Module):
         I tried multiple values and empirically, 0.25 matches the paper's compression rate and number of parameters.
         Note : In the paper, the authors used different sensitivity values for different layers.
         """
+        activation_stats = kwargs.get('activation_stats')
+        structured_first = bool(kwargs.get('structured_first', False))
+        target_sparsity = kwargs.get('target_sparsity')
+        if structured_first and activation_stats and target_sparsity is not None:
+            transformer_groups = discover_transformer_groups(self)
+            if transformer_groups:
+                executed_structured = _structured_transformer_pruning(
+                    self,
+                    transformer_groups,
+                    activation_stats,
+                    target_sparsity=target_sparsity,
+                    structured_ratio=float(kwargs.get('structured_ratio', 0.6)),
+                    prune_attn_heads=kwargs.get('prune_attn_heads', True),
+                    prune_mlp_channels=kwargs.get('prune_mlp_channels', True),
+                    prune_embeddings=kwargs.get('prune_embeddings', False),
+                    prune_lm_head=kwargs.get('prune_lm_head', False),
+                    weight_power=float(kwargs.get('weight_power', 1.0)),
+                    tf_power=float(kwargs.get('tf_power', 1.0)),
+                    idf_power=float(kwargs.get('idf_power', 1.0)),
+                    idf_add=float(kwargs.get('idf_add', 1.0)),
+                    idf_smooth=float(kwargs.get('idf_smooth', 1.0)),
+                    grad_spice=float(kwargs.get('grad_spice', 0.0)),
+                    global_topk=bool(kwargs.get('global_topk', True)),
+                )
+                if executed_structured:
+                    return
+
         neuron_groups = self._neuron_pruning_groups()
         if neuron_groups:
             _prune_neuron_groups_by_std(neuron_groups, s)
@@ -335,6 +391,16 @@ class PruningModule(Module):
         grad_power: float = 1.0,
         grad_mix: float = 0.75,
         grad_normalise_doc_freq: bool = True,
+        *,
+        target_sparsity: Optional[float] = None,
+        structured_first: bool = True,
+        prune_attn_heads: bool = True,
+        prune_mlp_channels: bool = True,
+        prune_embeddings: bool = False,
+        prune_lm_head: bool = False,
+        global_topk: bool = True,
+        structured_ratio: float = 0.6,
+        grad_spice: float = 0.0,
     ):
         """Prune connections using a NeuronRank (NeuronRank inspired) inspired score.
 
@@ -379,6 +445,29 @@ class PruningModule(Module):
             grad_normalise_doc_freq (bool): If ``True`` normalise gradient document
                 frequencies by sample counts when computing the gradient IDF term.
         """
+
+        transformer_groups = discover_transformer_groups(self)
+        if structured_first:
+            executed_structured = _structured_transformer_pruning(
+                self,
+                transformer_groups,
+                activation_stats,
+                target_sparsity=target_sparsity,
+                structured_ratio=structured_ratio,
+                prune_attn_heads=prune_attn_heads,
+                prune_mlp_channels=prune_mlp_channels,
+                prune_embeddings=prune_embeddings,
+                prune_lm_head=prune_lm_head,
+                weight_power=weight_power,
+                tf_power=tf_power,
+                idf_power=idf_power,
+                idf_add=idf_add,
+                idf_smooth=idf_smooth,
+                grad_spice=grad_spice,
+                global_topk=global_topk,
+            )
+            if executed_structured:
+                return
 
         neuron_groups = self._neuron_pruning_groups()
         if neuron_groups:
@@ -690,6 +779,7 @@ class MaskedLinear(Module):
         self.weight = Parameter(torch.Tensor(out_features, in_features))
         # Initialize the mask with 1
         self.mask = Parameter(torch.ones([out_features, in_features]), requires_grad=False)
+        self.weight.register_hook(lambda grad: grad * self.mask)
         if bias:
             self.bias = Parameter(torch.Tensor(out_features))
         else:
@@ -737,6 +827,7 @@ class MaskedEmbedding(nn.Embedding):
         super().__init__(num_embeddings, embedding_dim, **kwargs)
         mask = torch.ones_like(self.weight)
         self.mask = Parameter(mask, requires_grad=False)
+        self.weight.register_hook(lambda grad: grad * self.mask)
 
     def forward(self, input):
         masked_weight = self.weight * self.mask
@@ -796,6 +887,724 @@ class NeuronPruningGroup:
     module_in_name: str
     module_out: Optional[MaskedLinear]
     module_out_name: Optional[str]
+
+
+def discover_transformer_groups(model: PruningModule) -> Dict[str, Dict[str, Dict[str, object]]]:
+    """Discover MLP and attention parameter groups for transformer-style blocks."""
+
+    name_to_module = dict(model.named_modules())
+
+    config = getattr(model, 'config', None)
+    default_n_head = None
+    default_d_model = None
+    if config is not None:
+        for attr in ('n_head', 'num_attention_heads', 'num_heads'):
+            value = getattr(config, attr, None)
+            if value is not None:
+                default_n_head = int(value)
+                break
+        for attr in ('n_embd', 'hidden_size', 'd_model', 'embed_dim'):
+            value = getattr(config, attr, None)
+            if value is not None:
+                default_d_model = int(value)
+                break
+
+    mlp_up_suffixes = {
+        'c_fc',
+        'fc_in',
+        'fc1',
+        'fc_1',
+        'w_in',
+        'up_proj',
+        'gate_proj',
+    }
+    mlp_down_suffixes = {
+        'c_proj',
+        'fc_out',
+        'fc2',
+        'fc_2',
+        'proj',
+        'down_proj',
+        'w_out',
+    }
+    attn_out_suffixes = {'c_proj', 'o_proj', 'out_proj', 'proj'}
+    q_suffixes = {'q_proj', 'q', 'query'}
+    k_suffixes = {'k_proj', 'k', 'key'}
+    v_suffixes = {'v_proj', 'v', 'value'}
+
+    groups: Dict[str, Dict[str, Dict[str, object]]] = {}
+
+    for module_name, module in model.named_modules():
+        if module is model:
+            continue
+        if not hasattr(module, 'weight'):
+            continue
+
+        parts = module_name.split('.')
+        if 'mlp' in parts:
+            idx = parts.index('mlp')
+            block_id = '.'.join(parts[:idx])
+            if not block_id:
+                continue
+            suffix = parts[-1].lower()
+            block_entry = groups.setdefault(block_id, {})
+            mlp_entry = block_entry.setdefault('mlp', {
+                'up': None,
+                'down': None,
+                'up_name': None,
+                'down_name': None,
+                'd_mid': None,
+            })
+            weight = getattr(module, 'weight', None)
+            if weight is None or weight.dim() != 2:
+                continue
+            out_features, in_features = weight.shape[0], weight.shape[1]
+            if suffix in mlp_up_suffixes or (suffix not in mlp_down_suffixes and out_features >= in_features):
+                if mlp_entry['up'] is None:
+                    mlp_entry['up'] = module
+                    mlp_entry['up_name'] = module_name
+                    mlp_entry['d_mid'] = out_features
+            if suffix in mlp_down_suffixes or (suffix not in mlp_up_suffixes and out_features <= in_features):
+                if mlp_entry['down'] is None:
+                    mlp_entry['down'] = module
+                    mlp_entry['down_name'] = module_name
+                    mlp_entry['d_mid'] = in_features
+            continue
+
+        if 'attn' in parts:
+            idx = parts.index('attn')
+            block_id = '.'.join(parts[:idx])
+            if not block_id:
+                continue
+            suffix = parts[-1].lower()
+            block_entry = groups.setdefault(block_id, {})
+            attn_entry = block_entry.setdefault('attn', {
+                'type': None,
+                'q': None,
+                'k': None,
+                'v': None,
+                'o': None,
+                'qkv': None,
+                'q_name': None,
+                'k_name': None,
+                'v_name': None,
+                'o_name': None,
+                'qkv_name': None,
+                'n_head': None,
+                'head_dim': None,
+            })
+            weight = getattr(module, 'weight', None)
+            if suffix == 'c_attn':
+                attn_entry['type'] = 'fused'
+                attn_entry['qkv'] = module
+                attn_entry['qkv_name'] = module_name
+            elif suffix in attn_out_suffixes:
+                attn_entry['o'] = module
+                attn_entry['o_name'] = module_name
+            else:
+                # Separate projections
+                attn_entry['type'] = 'separate' if attn_entry['type'] is None else attn_entry['type']
+                if suffix in q_suffixes and attn_entry['q'] is None:
+                    attn_entry['q'] = module
+                    attn_entry['q_name'] = module_name
+                elif suffix in k_suffixes and attn_entry['k'] is None:
+                    attn_entry['k'] = module
+                    attn_entry['k_name'] = module_name
+                elif suffix in v_suffixes and attn_entry['v'] is None:
+                    attn_entry['v'] = module
+                    attn_entry['v_name'] = module_name
+
+    for block_id, block_entry in groups.items():
+        block_module = name_to_module.get(block_id)
+        block_config = getattr(block_module, 'config', None) if block_module is not None else None
+        n_head = None
+        if block_config is not None:
+            for attr in ('n_head', 'num_attention_heads', 'num_heads'):
+                value = getattr(block_config, attr, None)
+                if value is not None:
+                    n_head = int(value)
+                    break
+        if n_head is None:
+            n_head = default_n_head
+
+        d_model = None
+        if block_config is not None:
+            for attr in ('n_embd', 'hidden_size', 'd_model', 'embed_dim'):
+                value = getattr(block_config, attr, None)
+                if value is not None:
+                    d_model = int(value)
+                    break
+        if d_model is None:
+            d_model = default_d_model
+
+        mlp_entry = block_entry.get('mlp')
+        if mlp_entry:
+            down_module = mlp_entry.get('down')
+            if d_model is None and down_module is not None and hasattr(down_module, 'weight'):
+                weight = down_module.weight
+                if weight.dim() >= 2:
+                    d_model = int(weight.shape[0])
+
+        attn_entry = block_entry.get('attn')
+        if attn_entry:
+            if attn_entry.get('type') == 'fused' and attn_entry.get('qkv') is not None:
+                weight = attn_entry['qkv'].weight
+                if weight.dim() >= 2:
+                    total_out = weight.shape[1] if weight.shape[1] % 3 == 0 else weight.shape[0]
+                    if total_out % 3 == 0:
+                        inferred = total_out // 3
+                        d_model = d_model or inferred
+            elif attn_entry.get('q') is not None and hasattr(attn_entry['q'], 'weight'):
+                weight = attn_entry['q'].weight
+                if weight.dim() >= 2:
+                    inferred = weight.shape[0]
+                    d_model = d_model or inferred
+
+            attn_entry['n_head'] = n_head
+            if d_model is not None and n_head:
+                attn_entry['head_dim'] = d_model // n_head if n_head > 0 else None
+            else:
+                attn_entry['head_dim'] = None
+
+    # Remove blocks without valid MLP or attention groups
+    cleaned: Dict[str, Dict[str, Dict[str, object]]] = {}
+    for block_id, block_entry in groups.items():
+        mlp_entry = block_entry.get('mlp')
+        attn_entry = block_entry.get('attn')
+        if mlp_entry:
+            if not mlp_entry.get('up') or not mlp_entry.get('down'):
+                block_entry.pop('mlp', None)
+        if attn_entry:
+            attn_type = attn_entry.get('type')
+            if attn_type == 'fused':
+                if not attn_entry.get('qkv') or not attn_entry.get('o'):
+                    block_entry.pop('attn', None)
+            elif attn_type == 'separate':
+                if not (attn_entry.get('q') and attn_entry.get('k') and attn_entry.get('v') and attn_entry.get('o')):
+                    block_entry.pop('attn', None)
+            else:
+                block_entry.pop('attn', None)
+        if block_entry:
+            cleaned[block_id] = block_entry
+
+    return cleaned
+
+
+
+
+def _is_conv1d(module: nn.Module) -> bool:
+    return module.__class__.__name__ == 'Conv1D'
+
+
+def _output_slice(mask: torch.Tensor, module: nn.Module, start: int, end: int) -> torch.Tensor:
+    if _is_conv1d(module):
+        return mask[:, start:end]
+    return mask[start:end, :]
+
+
+def _input_slice(mask: torch.Tensor, module: nn.Module, start: int, end: int) -> torch.Tensor:
+    if _is_conv1d(module):
+        return mask[start:end, :]
+    return mask[:, start:end]
+
+
+def _zero_output_slice(module: nn.Module, start: int, end: int) -> None:
+    mask = module.mask.data.clone()
+    if _is_conv1d(module):
+        mask[:, start:end] = 0
+    else:
+        mask[start:end, :] = 0
+    module.apply_new_mask(mask)
+    bias = getattr(module, 'bias', None)
+    if bias is not None:
+        bias.data[start:end] = 0
+
+
+def _zero_input_slice(module: nn.Module, start: int, end: int) -> None:
+    mask = module.mask.data.clone()
+    if _is_conv1d(module):
+        mask[start:end, :] = 0
+    else:
+        mask[:, start:end] = 0
+    module.apply_new_mask(mask)
+
+
+def _structured_transformer_pruning(
+    model: PruningModule,
+    transformer_groups: Dict[str, Dict[str, Dict[str, object]]],
+    activation_stats: Dict[str, object],
+    *,
+    target_sparsity: Optional[float],
+    structured_ratio: float,
+    prune_attn_heads: bool,
+    prune_mlp_channels: bool,
+    prune_embeddings: bool,
+    prune_lm_head: bool,
+    weight_power: float,
+    tf_power: float,
+    idf_power: float,
+    idf_add: float,
+    idf_smooth: float,
+    grad_spice: float,
+    global_topk: bool,
+) -> bool:
+    block_stats = activation_stats.get('transformer_blocks') if activation_stats else None
+    if not block_stats:
+        return False
+    if target_sparsity is None:
+        return False
+
+    total_target = float(max(0.0, min(1.0, target_sparsity)))
+    structured_ratio = float(max(0.0, min(1.0, structured_ratio)))
+
+    module_meta: Dict[nn.Module, tuple[str, str]] = {}
+    mlp_meta: Dict[str, Dict[str, object]] = {}
+    attn_meta: Dict[str, Dict[str, object]] = {}
+
+    for block_id, info in transformer_groups.items():
+        mlp_info = info.get('mlp')
+        if mlp_info:
+            up_module = mlp_info.get('up')
+            down_module = mlp_info.get('down')
+            if up_module is not None:
+                module_meta[up_module] = ('mlp_up', block_id)
+            if down_module is not None:
+                module_meta[down_module] = ('mlp_down', block_id)
+            mlp_meta[block_id] = mlp_info
+        attn_info = info.get('attn')
+        if attn_info:
+            attn_type = attn_info.get('type')
+            if attn_type == 'fused':
+                qkv = attn_info.get('qkv')
+                o_module = attn_info.get('o')
+                if qkv is not None:
+                    module_meta[qkv] = ('attn_qkv', block_id)
+                if o_module is not None:
+                    module_meta[o_module] = ('attn_o', block_id)
+            elif attn_type == 'separate':
+                q = attn_info.get('q')
+                k = attn_info.get('k')
+                v = attn_info.get('v')
+                o_module = attn_info.get('o')
+                if q is not None:
+                    module_meta[q] = ('attn_q', block_id)
+                if k is not None:
+                    module_meta[k] = ('attn_k', block_id)
+                if v is not None:
+                    module_meta[v] = ('attn_v', block_id)
+                if o_module is not None:
+                    module_meta[o_module] = ('attn_o', block_id)
+            attn_meta[block_id] = attn_info
+
+    if not module_meta:
+        return False
+
+    if not global_topk:
+        print('Per-layer Top-K not implemented; using global ranking for pruning.')
+
+    lm_head_module = getattr(model, 'lm_head', None)
+    lm_head_tied = False
+    if prune_lm_head and lm_head_module is not None and hasattr(lm_head_module, 'weight'):
+        lm_weight = lm_head_module.weight
+        for module in model.modules():
+            if module is lm_head_module:
+                continue
+            if hasattr(module, 'weight') and getattr(module, 'weight') is lm_weight:
+                lm_head_tied = True
+                break
+        if lm_head_tied:
+            print('LM head shares weights with embedding; skipping LM head pruning.')
+            prune_lm_head = False
+
+    prunable: List[tuple[str, nn.Module]] = []
+    for name, module in model.named_modules():
+        mask = getattr(module, 'mask', None)
+        if mask is None:
+            continue
+        if not prune_embeddings and isinstance(module, nn.Embedding):
+            continue
+        if lm_head_module is not None and module is lm_head_module and not prune_lm_head:
+            continue
+        prunable.append((name, module))
+
+    if not prunable:
+        return False
+
+    total_alive = 0
+    module_alive_counts: Dict[str, int] = {}
+    for name, module in prunable:
+        mask = module.mask.detach().to(dtype=torch.float32, device='cpu')
+        alive = int(mask.sum().item())
+        module_alive_counts[name] = alive
+        total_alive += alive
+
+    if total_alive == 0:
+        return False
+
+    target_total_prune = int(round(total_alive * total_target))
+    structured_target = int(round(target_total_prune * structured_ratio))
+
+    mlp_scores: Dict[str, torch.Tensor] = {}
+    attn_scores: Dict[str, torch.Tensor] = {}
+
+    for block_id, stats in block_stats.items():
+        if prune_mlp_channels and 'mlp' in stats and block_id in mlp_meta:
+            mlp_stat = stats['mlp']
+            sample_count = max(1, int(mlp_stat.get('sample_count', 0)))
+            tf_tensor = mlp_stat.get('tf')
+            df_tensor = mlp_stat.get('df')
+            if tf_tensor is not None and df_tensor is not None:
+                tf_component = tf_tensor.to(torch.float32).clamp(min=0.0).pow(tf_power)
+                df_values = df_tensor.to(torch.float32)
+                numerator = sample_count + idf_smooth + EPS
+                denominator = df_values + idf_smooth + EPS
+                idf_component = torch.log(torch.tensor(numerator, dtype=torch.float32) / denominator)
+                if idf_add != 0.0:
+                    idf_component = idf_component + idf_add
+                idf_component = idf_component.clamp(min=0.0).pow(idf_power)
+                score = tf_component * idf_component
+                if grad_spice > 0.0 and 'grad' in mlp_stat:
+                    grad_values = mlp_stat['grad'].to(torch.float32).clamp(min=0.0)
+                    score = score * grad_values.pow(grad_spice)
+                mlp_scores[block_id] = score.to(torch.float32)
+        if prune_attn_heads and 'attn' in stats and block_id in attn_meta:
+            attn_stat = stats['attn']
+            sample_count = max(1, int(attn_stat.get('sample_count', 0)))
+            tf_tensor = attn_stat.get('tf')
+            df_tensor = attn_stat.get('df')
+            if tf_tensor is not None and df_tensor is not None:
+                tf_component = tf_tensor.to(torch.float32).clamp(min=0.0).pow(tf_power)
+                df_values = df_tensor.to(torch.float32)
+                numerator = sample_count + idf_smooth + EPS
+                denominator = df_values + idf_smooth + EPS
+                idf_component = torch.log(torch.tensor(numerator, dtype=torch.float32) / denominator)
+                if idf_add != 0.0:
+                    idf_component = idf_component + idf_add
+                idf_component = idf_component.clamp(min=0.0).pow(idf_power)
+                score = tf_component * idf_component
+                if grad_spice > 0.0 and 'grad' in attn_stat:
+                    grad_values = attn_stat['grad'].to(torch.float32).clamp(min=0.0)
+                    score = score * grad_values.pow(grad_spice)
+                attn_scores[block_id] = score.to(torch.float32)
+
+    structured_candidates: List[Dict[str, object]] = []
+
+    if prune_mlp_channels:
+        for block_id, scores in mlp_scores.items():
+            mlp_info = mlp_meta.get(block_id)
+            if not mlp_info:
+                continue
+            up_module = mlp_info.get('up')
+            down_module = mlp_info.get('down')
+            if up_module is None or down_module is None:
+                continue
+            up_mask = up_module.mask.detach().to(device='cpu')
+            down_mask = down_module.mask.detach().to(device='cpu')
+            channel_count = min(int(scores.numel()), up_mask.size(0), down_mask.size(1))
+            for idx in range(channel_count):
+                row_alive = bool(up_mask[idx].any())
+                col_alive = bool(down_mask[:, idx].any())
+                if not (row_alive and col_alive):
+                    continue
+                weight_count = int(up_mask[idx].sum().item() + down_mask[:, idx].sum().item())
+                structured_candidates.append({
+                    'type': 'mlp',
+                    'block': block_id,
+                    'index': idx,
+                    'score': float(scores[idx].item()),
+                    'weight_count': weight_count,
+                })
+
+    if prune_attn_heads:
+        for block_id, scores in attn_scores.items():
+            attn_info = attn_meta.get(block_id)
+            if not attn_info:
+                continue
+            attn_type = attn_info.get('type')
+            n_head = int(attn_info.get('n_head') or 0)
+            head_dim = attn_info.get('head_dim')
+            if n_head <= 0 or head_dim is None or scores.numel() < n_head:
+                continue
+            o_module = attn_info.get('o')
+            if o_module is None:
+                continue
+            o_mask = o_module.mask.detach().to(device='cpu')
+            if attn_type == 'fused':
+                qkv = attn_info.get('qkv')
+                if qkv is None:
+                    continue
+                qkv_mask = qkv.mask.detach().to(device='cpu')
+                hidden_dim = head_dim * n_head
+                for head_idx in range(n_head):
+                    q_start = head_idx * head_dim
+                    k_start = hidden_dim + q_start
+                    v_start = 2 * hidden_dim + q_start
+                    q_slice = _output_slice(qkv_mask, qkv, q_start, q_start + head_dim)
+                    k_slice = _output_slice(qkv_mask, qkv, k_start, k_start + head_dim)
+                    v_slice = _output_slice(qkv_mask, qkv, v_start, v_start + head_dim)
+                    o_slice = _output_slice(o_mask, o_module, head_idx * head_dim, (head_idx + 1) * head_dim)
+                    alive = any(t.sum().item() > 0 for t in (q_slice, k_slice, v_slice, o_slice))
+                    if not alive:
+                        continue
+                    weight_count = int(q_slice.sum().item() + k_slice.sum().item() + v_slice.sum().item() + o_slice.sum().item())
+                    structured_candidates.append({
+                        'type': 'attn_fused',
+                        'block': block_id,
+                        'index': head_idx,
+                        'score': float(scores[head_idx].item()),
+                        'weight_count': weight_count,
+                    })
+            else:
+                q = attn_info.get('q')
+                k = attn_info.get('k')
+                v = attn_info.get('v')
+                if q is None or k is None or v is None:
+                    continue
+                q_mask = q.mask.detach().to(device='cpu')
+                k_mask = k.mask.detach().to(device='cpu')
+                v_mask = v.mask.detach().to(device='cpu')
+                for head_idx in range(n_head):
+                    start = head_idx * head_dim
+                    end = start + head_dim
+                    q_slice = _output_slice(q_mask, q, start, end)
+                    k_slice = _output_slice(k_mask, k, start, end)
+                    v_slice = _output_slice(v_mask, v, start, end)
+                    o_slice = _output_slice(o_mask, o_module, start, end)
+                    alive = any(t.sum().item() > 0 for t in (q_slice, k_slice, v_slice, o_slice))
+                    if not alive:
+                        continue
+                    weight_count = int(q_slice.sum().item() + k_slice.sum().item() + v_slice.sum().item() + o_slice.sum().item())
+                    structured_candidates.append({
+                        'type': 'attn_separate',
+                        'block': block_id,
+                        'index': head_idx,
+                        'score': float(scores[head_idx].item()),
+                        'weight_count': weight_count,
+                    })
+
+    structured_candidates.sort(key=lambda item: (item['score'], item['weight_count']))
+
+    structured_pruned = 0
+    pruned_mlp: Dict[str, List[int]] = {}
+    pruned_heads: Dict[str, List[int]] = {}
+
+    for candidate in structured_candidates:
+        if structured_target <= 0:
+            break
+        if structured_pruned >= structured_target:
+            break
+        weight_count = int(candidate['weight_count'])
+        if weight_count <= 0:
+            continue
+        if structured_pruned > 0 and structured_pruned + weight_count > structured_target:
+            continue
+        block_id = candidate['block']
+        index = int(candidate['index'])
+        if candidate['type'] == 'mlp':
+            mlp_info = mlp_meta.get(block_id)
+            if not mlp_info:
+                continue
+            up_module = mlp_info.get('up')
+            down_module = mlp_info.get('down')
+            if up_module is None or down_module is None:
+                continue
+            _zero_output_slice(up_module, index, index + 1)
+            _zero_input_slice(down_module, index, index + 1)
+            pruned_mlp.setdefault(block_id, []).append(index)
+        elif candidate['type'] == 'attn_fused':
+            attn_info = attn_meta.get(block_id)
+            if not attn_info:
+                continue
+            qkv = attn_info.get('qkv')
+            o_module = attn_info.get('o')
+            n_head = int(attn_info.get('n_head') or 0)
+            head_dim = attn_info.get('head_dim')
+            if qkv is None or o_module is None or head_dim is None or n_head <= 0:
+                continue
+            hidden_dim = head_dim * n_head
+            head_idx = index
+            q_start = head_idx * head_dim
+            k_start = hidden_dim + q_start
+            v_start = 2 * hidden_dim + q_start
+            _zero_output_slice(qkv, q_start, q_start + head_dim)
+            _zero_output_slice(qkv, k_start, k_start + head_dim)
+            _zero_output_slice(qkv, v_start, v_start + head_dim)
+            _zero_output_slice(o_module, head_idx * head_dim, (head_idx + 1) * head_dim)
+            pruned_heads.setdefault(block_id, []).append(head_idx)
+        elif candidate['type'] == 'attn_separate':
+            attn_info = attn_meta.get(block_id)
+            if not attn_info:
+                continue
+            q = attn_info.get('q')
+            k = attn_info.get('k')
+            v = attn_info.get('v')
+            o_module = attn_info.get('o')
+            head_idx = index
+            head_dim = attn_info.get('head_dim')
+            if q is None or k is None or v is None or o_module is None or head_dim is None:
+                continue
+            start = head_idx * head_dim
+            end = start + head_dim
+            _zero_output_slice(q, start, end)
+            _zero_output_slice(k, start, end)
+            _zero_output_slice(v, start, end)
+            _zero_output_slice(o_module, start, end)
+            pruned_heads.setdefault(block_id, []).append(head_idx)
+        else:
+            continue
+        structured_pruned += weight_count
+
+    if pruned_mlp:
+        for block_id, indices in pruned_mlp.items():
+            print(f'Structured pruning (MLP) block {block_id}: pruned channels {sorted(indices)}')
+    if pruned_heads:
+        for block_id, indices in pruned_heads.items():
+            print(f'Structured pruning (attention) block {block_id}: pruned heads {sorted(indices)}')
+
+    total_removed_structured = structured_pruned
+    initial_alive = total_alive
+    if structured_target > 0:
+        target_ratio = structured_target / float(initial_alive)
+        achieved_ratio = total_removed_structured / float(initial_alive)
+        print(
+            f'After structured pruning: {total_removed_structured}/{initial_alive} weights removed '
+            f'({achieved_ratio * 100:.3f}% target {target_ratio * 100:.3f}%)'
+        )
+        if structured_target > 0:
+            assert abs(achieved_ratio - target_ratio) <= 1e-3 or total_removed_structured == structured_target
+
+    structured_stats = util.collect_nonzero_stats(model)
+    global_structured_sparsity = structured_stats.get('sparsity', 0.0)
+    print(f'Global sparsity after structured step: {global_structured_sparsity * 100:.3f}%')
+    for entry in structured_stats.get('per_param', []):
+        print(
+            f"  {entry['name']}: sparsity {entry['sparsity'] * 100:.3f}%"
+        )
+
+    # Unstructured pruning stage
+    alive_after_structured = 0
+    module_infos = []
+    for name, module in prunable:
+        mask = module.mask.detach().to(device='cpu')
+        mask_flat = mask.reshape(-1)
+        alive_indices = (mask_flat > 0).nonzero(as_tuple=True)[0]
+        if alive_indices.numel() == 0:
+            continue
+        meta = module_meta.get(module)
+        score_base = module.weight.detach().to(dtype=torch.float32, device='cpu').abs().pow(weight_power)
+        struct_multiplier = torch.ones_like(score_base, dtype=torch.float32)
+        if meta is not None:
+            kind, block_id = meta
+            if kind == 'mlp_up' and block_id in mlp_scores:
+                channel_scores = mlp_scores[block_id].to(torch.float32)
+                struct_multiplier = channel_scores.view(-1, 1).expand_as(score_base)
+            elif kind == 'mlp_down' and block_id in mlp_scores:
+                channel_scores = mlp_scores[block_id].to(torch.float32)
+                struct_multiplier = channel_scores.view(1, -1).expand_as(score_base)
+            elif kind == 'attn_qkv' and block_id in attn_scores and block_id in attn_meta:
+                head_scores = attn_scores[block_id].to(torch.float32)
+                attn_info = attn_meta[block_id]
+                n_head = int(attn_info.get('n_head') or 0)
+                head_dim = attn_info.get('head_dim')
+                if n_head > 0 and head_dim:
+                    hidden_dim = head_dim * n_head
+                    multiplier = torch.ones_like(score_base, dtype=torch.float32)
+                    for head_idx in range(n_head):
+                        score_value = float(head_scores[head_idx].item())
+                        q_start = head_idx * head_dim
+                        k_start = hidden_dim + q_start
+                        v_start = 2 * hidden_dim + q_start
+                        multiplier[:, q_start:q_start + head_dim] *= score_value
+                        multiplier[:, k_start:k_start + head_dim] *= score_value
+                        multiplier[:, v_start:v_start + head_dim] *= score_value
+                    struct_multiplier = multiplier
+            elif kind in {'attn_q', 'attn_k', 'attn_v'} and block_id in attn_scores and block_id in attn_meta:
+                head_scores = attn_scores[block_id].to(torch.float32)
+                attn_info = attn_meta[block_id]
+                head_dim = attn_info.get('head_dim')
+                if head_dim:
+                    multiplier = torch.ones_like(score_base, dtype=torch.float32)
+                    for head_idx in range(head_scores.numel()):
+                        score_value = float(head_scores[head_idx].item())
+                        start = head_idx * head_dim
+                        end = start + head_dim
+                        multiplier[start:end, :] *= score_value
+                    struct_multiplier = multiplier
+            elif kind == 'attn_o' and block_id in attn_scores and block_id in attn_meta:
+                head_scores = attn_scores[block_id].to(torch.float32)
+                attn_info = attn_meta[block_id]
+                head_dim = attn_info.get('head_dim')
+                if head_dim:
+                    multiplier = torch.ones_like(score_base, dtype=torch.float32)
+                    for head_idx in range(head_scores.numel()):
+                        score_value = float(head_scores[head_idx].item())
+                        start = head_idx * head_dim
+                        end = start + head_dim
+                        if _is_conv1d(module):
+                            multiplier[:, start:end] *= score_value
+                        else:
+                            multiplier[start:end, :] *= score_value
+                    struct_multiplier = multiplier
+        scores = score_base * struct_multiplier
+        scores = scores * mask
+        module_infos.append({
+            'module': module,
+            'name': name,
+            'mask': mask_flat.clone(),
+            'alive_indices': alive_indices,
+            'scores': scores.reshape(-1)[alive_indices],
+            'shape': mask.shape,
+        })
+        alive_after_structured += int(alive_indices.numel())
+
+    keep_total = max(0, total_alive - target_total_prune)
+    if alive_after_structured <= keep_total or not module_infos:
+        final_stats = util.collect_nonzero_stats(model)
+        final_sparsity = final_stats.get('sparsity', 0.0)
+        print(f'Final sparsity after pruning: {final_sparsity * 100:.3f}%')
+        for entry in final_stats.get('per_param', []):
+            print(f"  {entry['name']}: sparsity {entry['sparsity'] * 100:.3f}%")
+        return True
+
+    total_scores = torch.cat([info['scores'] for info in module_infos])
+    keep_total = min(keep_total, alive_after_structured)
+    if keep_total <= 0:
+        keep_mask = torch.zeros_like(total_scores, dtype=torch.bool)
+    else:
+        topk_vals, topk_indices = torch.topk(total_scores, keep_total, largest=True, sorted=False)
+        keep_mask = torch.zeros_like(total_scores, dtype=torch.bool)
+        keep_mask[topk_indices] = True
+
+    offset = 0
+    for info in module_infos:
+        length = info['scores'].numel()
+        mask_segment = keep_mask[offset:offset + length]
+        offset += length
+        alive_indices = info['alive_indices']
+        mask_flat = info['mask']
+        to_zero = alive_indices[~mask_segment]
+        if to_zero.numel() == 0:
+            continue
+        mask_flat[to_zero] = 0
+        new_mask = mask_flat.view(info['shape']).to(dtype=info['module'].mask.dtype, device=info['module'].mask.device)
+        info['module'].apply_new_mask(new_mask)
+
+    final_stats = util.collect_nonzero_stats(model)
+    final_sparsity = final_stats.get('sparsity', 0.0)
+    print(f'Final sparsity after pruning: {final_sparsity * 100:.3f}%')
+    for entry in final_stats.get('per_param', []):
+        print(f"  {entry['name']}: sparsity {entry['sparsity'] * 100:.3f}%")
+
+    total_removed = total_alive - sum(int(info['mask'].sum().item()) for info in module_infos)
+    achieved_total_ratio = total_removed / float(initial_alive)
+    print(
+        f'Overall pruning removed {total_removed}/{initial_alive} weights '
+        f'({achieved_total_ratio * 100:.3f}% target {total_target * 100:.3f}%)'
+    )
+    if target_total_prune > 0:
+        assert abs(achieved_total_ratio - total_target) <= 1e-3
+
+    return True
 
 
 def _build_neuron_pruning_groups(model: PruningModule) -> List[NeuronPruningGroup]:
