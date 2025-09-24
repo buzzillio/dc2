@@ -32,6 +32,7 @@ def _ensure_mask(module: nn.Module) -> None:
 
     mask = torch.ones_like(module.weight, dtype=module.weight.dtype)
     module.register_buffer('mask', mask)
+    module.weight.register_hook(lambda grad, module=module: grad * module.mask)
 
     def apply_new_mask(self: nn.Module, new_mask: torch.Tensor) -> None:
         new_mask = new_mask.to(self.mask.device, dtype=self.mask.dtype)

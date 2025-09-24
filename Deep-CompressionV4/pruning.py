@@ -21,6 +21,20 @@ from gpt import (
     build_wikitext2_dataloaders,
 )
 import util
+from net.prune import discover_transformer_groups
+
+
+def str2bool(value: str) -> bool:
+    """Parse flexible boolean values from the command line."""
+
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {'y', 'yes', 't', 'true', '1'}:
+        return True
+    if lowered in {'n', 'no', 'f', 'false', '0'}:
+        return False
+    raise argparse.ArgumentTypeError(f'Expected a boolean value, got {value!r}.')
 
 
 # Global state (populated per run)
@@ -108,6 +122,69 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--target-sparsity', type=float, default=None,
                         help='desired sparsity (0-1) – converted to percentile threshold when provided')
 
+    parser.add_argument('--prune-attn-heads', dest='prune_attn_heads', action='store_true',
+                        help='enable structured pruning of attention heads (default: enabled)')
+    parser.add_argument('--no-prune-attn-heads', dest='prune_attn_heads', action='store_false',
+                        help='disable structured pruning of attention heads')
+    parser.set_defaults(prune_attn_heads=True)
+
+    parser.add_argument('--prune-mlp-channels', dest='prune_mlp_channels', action='store_true',
+                        help='enable structured pruning of MLP hidden channels (default: enabled)')
+    parser.add_argument('--no-prune-mlp-channels', dest='prune_mlp_channels', action='store_false',
+                        help='disable structured pruning of MLP hidden channels')
+    parser.set_defaults(prune_mlp_channels=True)
+
+    parser.add_argument('--prune-embeddings', dest='prune_embeddings', action='store_true',
+                        help='allow pruning of embedding layers (default: disabled)')
+    parser.add_argument('--no-prune-embeddings', dest='prune_embeddings', action='store_false',
+                        help='forbid pruning of embedding layers')
+    parser.set_defaults(prune_embeddings=False)
+
+    parser.add_argument('--prune-lm-head', dest='prune_lm_head', action='store_true',
+                        help='allow pruning of language-model output head (default: disabled)')
+    parser.add_argument('--no-prune-lm-head', dest='prune_lm_head', action='store_false',
+                        help='forbid pruning of language-model output head')
+    parser.set_defaults(prune_lm_head=False)
+
+    parser.add_argument('--structured-first', dest='structured_first', action='store_true',
+                        help='perform structured pruning before unstructured (default: enabled)')
+    parser.add_argument('--no-structured-first', dest='structured_first', action='store_false',
+                        help='disable the structured-first pruning stage')
+    parser.set_defaults(structured_first=True)
+
+    parser.add_argument('--df-quantile', type=float, default=0.8,
+                        help='quantile used when counting document frequency presence for activations')
+    parser.add_argument(
+        '--tf-power', '--neuronrank-tf-power',
+        type=float,
+        default=0.75,
+        dest='neuronrank_tf_power',
+        help='exponent applied to mean activation (TF) for scoring',
+    )
+    parser.add_argument(
+        '--idf-power', '--neuronrank-idf-power',
+        type=float,
+        default=0.5,
+        dest='neuronrank_idf_power',
+        help='exponent applied to IDF for scoring',
+    )
+    parser.add_argument(
+        '--weight-power', '--neuronrank-weight-power',
+        type=float,
+        default=1.0,
+        dest='neuronrank_weight_power',
+        help='exponent applied to weight magnitudes during scoring',
+    )
+    parser.add_argument('--grad-spice', type=float, default=0.0,
+                        help='exponent applied to gradient sensitivity component when available')
+    parser.add_argument('--global-topk', dest='global_topk', action='store_true',
+                        help='use global Top-K thresholding when pruning (default: enabled)')
+    parser.add_argument('--no-global-topk', dest='global_topk', action='store_false',
+                        help='disable global Top-K enforcement')
+    parser.set_defaults(global_topk=True)
+    parser.add_argument('--structured-ratio', type=float, default=0.6,
+                        help='fraction of target sparsity allocated to structured pruning before unstructured pruning')
+
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='path to trained checkpoint for --mode prune')
     parser.add_argument('--output-checkpoint', type=str, default=None,
@@ -132,15 +209,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--neuronrank-idf-add', type=float, default=1.0,
                         dest='neuronrank_idf_add',
                         help='constant added to IDF before exponentiation')
-    parser.add_argument('--neuronrank-idf-power', type=float, default=1.0,
-                        dest='neuronrank_idf_power',
-                        help='exponent applied to IDF term')
-    parser.add_argument('--neuronrank-tf-power', type=float, default=1.0,
-                        dest='neuronrank_tf_power',
-                        help='exponent applied to mean activation (TF)')
-    parser.add_argument('--neuronrank-weight-power', type=float, default=1.0,
-                        dest='neuronrank_weight_power',
-                        help='exponent applied to weight magnitude')
     parser.add_argument('--neuronrank-global-threshold', action='store_true', default=False,
                         dest='neuronrank_global_threshold',
                         help='if set, use a single NeuronRank threshold across all layers')
@@ -248,6 +316,290 @@ def maybe_log_metric(prefix: str, metrics: Dict[str, float]) -> None:
     value = metrics.get(key)
     if value is not None:
         maybe_log(f'{prefix}_{key} {value}')
+
+
+
+def _collect_transformer_block_statistics(
+    mdl: nn.Module,
+    data_loader,
+    transformer_groups: Dict[str, Dict[str, Dict[str, object]]],
+    *,
+    df_quantile: float,
+    max_batches: Optional[int],
+    collect_gradients: bool,
+) -> Optional[Dict[str, object]]:
+    if not transformer_groups:
+        return None
+
+    df_quantile = float(max(0.0, min(1.0, df_quantile)))
+
+    block_accumulators: Dict[str, Dict[str, object]] = {}
+    handles = []
+
+    def init_mlp_accumulator(size: int) -> Dict[str, object]:
+        tensor_shape = (size,)
+        return {
+            'norm_sum': torch.zeros(tensor_shape, dtype=torch.float32),
+            'df_count': torch.zeros(tensor_shape, dtype=torch.float32),
+            'threshold': torch.zeros(tensor_shape, dtype=torch.float32),
+            'sample_count': 0,
+            'batch_count': 0,
+            'grad_abs_sum': torch.zeros(tensor_shape, dtype=torch.float32),
+            'grad_sample_count': 0,
+        }
+
+    def init_attn_accumulator(heads: int) -> Dict[str, object]:
+        tensor_shape = (heads,)
+        return {
+            'norm_sum': torch.zeros(tensor_shape, dtype=torch.float32),
+            'df_count': torch.zeros(tensor_shape, dtype=torch.float32),
+            'threshold': torch.zeros(tensor_shape, dtype=torch.float32),
+            'sample_count': 0,
+            'batch_count': 0,
+            'grad_norm_sum': torch.zeros(tensor_shape, dtype=torch.float32),
+            'grad_sample_count': 0,
+        }
+
+    for block_id, block_info in transformer_groups.items():
+        accum = block_accumulators.setdefault(block_id, {})
+        mlp_info = block_info.get('mlp')
+        if mlp_info and mlp_info.get('down') is not None:
+            d_mid = int(mlp_info.get('d_mid') or 0)
+            if d_mid > 0:
+                accum['mlp'] = init_mlp_accumulator(d_mid)
+        attn_info = block_info.get('attn')
+        if attn_info and attn_info.get('o') is not None:
+            n_head = int(attn_info.get('n_head') or 0)
+            if n_head > 0:
+                accum['attn'] = init_attn_accumulator(n_head)
+
+    for block_id, block_info in transformer_groups.items():
+        accum = block_accumulators.get(block_id)
+        if not accum:
+            continue
+
+        mlp_info = block_info.get('mlp')
+        if mlp_info and 'mlp' in accum:
+            down_module = mlp_info.get('down')
+            if down_module is not None:
+                mlp_accum = accum['mlp']
+
+                def make_mlp_hook(target_accum):
+                    def hook(module, inputs, output):
+                        if not inputs:
+                            return
+                        features = inputs[0]
+                        if features is None:
+                            return
+                        with torch.no_grad():
+                            values = features.detach().to(dtype=torch.float32, device='cpu')
+                        if values.dim() < 2:
+                            values = values.reshape(1, -1)
+                        else:
+                            values = values.reshape(-1, values.size(-1))
+                        if values.size(1) != target_accum['norm_sum'].numel():
+                            return
+                        norms = torch.linalg.norm(values, dim=0)
+                        target_accum['norm_sum'] += norms
+                        target_accum['batch_count'] += 1
+                        target_accum['sample_count'] += int(values.size(0))
+                        if values.size(0) > 0:
+                            batch_quantile = torch.quantile(values, df_quantile, dim=0)
+                            count = target_accum['batch_count']
+                            if count == 1:
+                                target_accum['threshold'] = batch_quantile
+                            else:
+                                momentum = 1.0 / float(count)
+                                target_accum['threshold'] = target_accum['threshold'] + (
+                                    batch_quantile - target_accum['threshold']
+                                ) * momentum
+                            threshold = target_accum['threshold']
+                            target_accum['df_count'] += (values > threshold).sum(dim=0)
+
+                        if collect_gradients and features.requires_grad:
+                            def grad_hook(grad):
+                                if grad is None:
+                                    return
+                                grad_values = grad.detach().to(dtype=torch.float32, device='cpu')
+                                if grad_values.dim() < 2:
+                                    grad_values = grad_values.reshape(1, -1)
+                                else:
+                                    grad_values = grad_values.reshape(-1, grad_values.size(-1))
+                                if grad_values.size(1) != target_accum['grad_abs_sum'].numel():
+                                    return
+                                target_accum['grad_abs_sum'] += grad_values.abs().sum(dim=0)
+                                target_accum['grad_sample_count'] += int(grad_values.size(0))
+
+                            features.register_hook(grad_hook)
+
+                    return hook
+
+                handles.append(down_module.register_forward_hook(make_mlp_hook(mlp_accum)))
+
+        attn_info = block_info.get('attn')
+        if attn_info and 'attn' in accum:
+            o_module = attn_info.get('o')
+            if o_module is not None:
+                attn_accum = accum['attn']
+                n_head = int(attn_info.get('n_head') or 0)
+                head_dim = attn_info.get('head_dim')
+
+                def make_attn_hook(target_accum, n_head_local: int, head_dim_local: Optional[int]):
+                    def hook(module, inputs, output):
+                        if not inputs:
+                            return
+                        attn_output = inputs[0]
+                        if attn_output is None:
+                            return
+                        with torch.no_grad():
+                            values = attn_output.detach().to(dtype=torch.float32, device='cpu')
+                        last_dim = values.size(-1)
+                        head_dim_eff = head_dim_local if head_dim_local and head_dim_local > 0 else None
+                        if head_dim_eff is None or head_dim_eff * n_head_local != last_dim:
+                            if n_head_local > 0 and last_dim % n_head_local == 0:
+                                head_dim_eff = last_dim // n_head_local
+                            else:
+                                return
+                        reshaped = values.reshape(-1, n_head_local, head_dim_eff)
+                        norms = torch.linalg.norm(reshaped, dim=-1)
+                        target_accum['norm_sum'] += norms.sum(dim=0)
+                        target_accum['sample_count'] += int(norms.size(0))
+                        target_accum['batch_count'] += 1
+                        batch_quantile = torch.quantile(norms, df_quantile, dim=0)
+                        count = target_accum['batch_count']
+                        if count == 1:
+                            target_accum['threshold'] = batch_quantile
+                        else:
+                            momentum = 1.0 / float(count)
+                            target_accum['threshold'] = target_accum['threshold'] + (
+                                batch_quantile - target_accum['threshold']
+                            ) * momentum
+                        threshold = target_accum['threshold']
+                        target_accum['df_count'] += (norms > threshold).sum(dim=0)
+
+                        if collect_gradients and attn_output.requires_grad:
+                            def grad_hook(grad):
+                                if grad is None:
+                                    return
+                                grad_values = grad.detach().to(dtype=torch.float32, device='cpu')
+                                grad_values = grad_values.reshape(-1, n_head_local, head_dim_eff)
+                                grad_norms = torch.linalg.norm(grad_values, dim=-1)
+                                target_accum['grad_norm_sum'] += grad_norms.sum(dim=0)
+                                target_accum['grad_sample_count'] += int(grad_norms.size(0))
+
+                            attn_output.register_hook(grad_hook)
+
+                    return hook
+
+                handles.append(o_module.register_forward_hook(make_attn_hook(attn_accum, n_head, head_dim)))
+
+    if not block_accumulators:
+        for handle in handles:
+            handle.remove()
+        return None
+
+    if max_batches is not None:
+        max_batches = min(max_batches, 1500)
+
+    data_iterable = data_loader
+    if isinstance(data_loader, torch.utils.data.DataLoader):
+        loader_kwargs = {
+            'batch_size': data_loader.batch_size or 1,
+            'shuffle': False,
+            'num_workers': 0,
+            'pin_memory': data_loader.pin_memory,
+            'drop_last': False,
+        }
+        if data_loader.collate_fn is not None:
+            loader_kwargs['collate_fn'] = data_loader.collate_fn
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+        try:
+            data_iterable = torch.utils.data.DataLoader(
+                data_loader.dataset,
+                generator=generator,
+                **loader_kwargs,
+            )
+        except TypeError:
+            data_iterable = torch.utils.data.DataLoader(
+                data_loader.dataset,
+                **loader_kwargs,
+            )
+
+    was_training = mdl.training
+    mdl.eval()
+
+    grad_context = torch.enable_grad() if collect_gradients else torch.no_grad()
+
+    with grad_context:
+        for batch_idx, batch in enumerate(data_iterable):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            if collect_gradients:
+                mdl.zero_grad(set_to_none=True)
+
+            inputs = {key: value.to(device, non_blocking=non_blocking) for key, value in batch.items()}
+            if not collect_gradients:
+                inputs = {key: value for key, value in inputs.items() if key != 'labels'}
+            outputs = mdl(**inputs)
+            if collect_gradients:
+                loss = getattr(outputs, 'loss', None)
+                if loss is None:
+                    raise RuntimeError('Language model forward pass did not return a loss value for gradient statistics.')
+                loss.backward()
+                mdl.zero_grad(set_to_none=True)
+
+    for handle in handles:
+        handle.remove()
+
+    if was_training:
+        mdl.train()
+
+    results: Dict[str, Dict[str, object]] = {}
+    for block_id, accum in block_accumulators.items():
+        block_entry: Dict[str, object] = {}
+        mlp_accum = accum.get('mlp')
+        if mlp_accum:
+            count = max(1, mlp_accum['batch_count'])
+            tf_values = mlp_accum['norm_sum'] / float(count)
+            block_entry['mlp'] = {
+                'tf': tf_values,
+                'df': mlp_accum['df_count'],
+                'sample_count': mlp_accum['sample_count'],
+            }
+            if collect_gradients and mlp_accum['grad_sample_count'] > 0:
+                grad_mean = mlp_accum['grad_abs_sum'] / float(mlp_accum['grad_sample_count'])
+                block_entry['mlp']['grad'] = grad_mean
+
+        attn_accum = accum.get('attn')
+        attn_info = transformer_groups.get(block_id, {}).get('attn', {})
+        if attn_accum and attn_info:
+            count = max(1, attn_accum['sample_count'])
+            tf_values = attn_accum['norm_sum'] / float(count)
+            attn_entry = {
+                'tf': tf_values,
+                'df': attn_accum['df_count'],
+                'sample_count': attn_accum['sample_count'],
+                'n_head': attn_info.get('n_head'),
+                'head_dim': attn_info.get('head_dim'),
+            }
+            if collect_gradients and attn_accum['grad_sample_count'] > 0:
+                grad_mean = attn_accum['grad_norm_sum'] / float(attn_accum['grad_sample_count'])
+                attn_entry['grad'] = grad_mean
+            block_entry['attn'] = attn_entry
+
+        if block_entry:
+            results[block_id] = block_entry
+
+    if not results:
+        return None
+
+    return {
+        'transformer_blocks': results,
+        'df_quantile': df_quantile,
+        'collect_gradients': bool(collect_gradients),
+    }
 
 
 
@@ -521,6 +873,10 @@ def train_model(
     if epochs <= 0:
         return {'average_epoch_time': 0.0, 'epochs_completed': 0}
 
+    baseline_alive = None
+    if mask_grad:
+        baseline_alive = util.collect_nonzero_stats(model)['alive']
+
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         adjust_learning_rate(optimizer, epoch, base_lr)
@@ -581,6 +937,11 @@ def train_model(
         epoch_duration = time.perf_counter() - epoch_start
         epoch_durations.append(epoch_duration)
         completed_epochs += 1
+
+        if mask_grad and baseline_alive is not None:
+            current_alive = util.collect_nonzero_stats(model)['alive']
+            if current_alive != baseline_alive:
+                raise RuntimeError('Pruned weights resurrected during retraining.')
 
     if completed_epochs > 0:
         average_epoch_time = sum(epoch_durations) / completed_epochs
@@ -652,6 +1013,32 @@ def collect_activation_statistics(
     include_gradients: Optional[bool] = None,
     gradient_threshold: float = 0.0,
 ) -> Dict:
+    if (
+        args.model in ('gpt2', 'nanogpt')
+        and getattr(args, 'structured_first', True)
+    ):
+        transformer_groups = discover_transformer_groups(mdl)
+        if transformer_groups:
+            df_quantile = getattr(args, 'df_quantile', 0.8)
+            gradients_flag = (
+                neuronrank_should_use_gradients()
+                if include_gradients is None
+                else include_gradients
+            )
+            if getattr(args, 'grad_spice', 0.0) > 0:
+                gradients_flag = True
+            block_stats = _collect_transformer_block_statistics(
+                mdl,
+                data_loader,
+                transformer_groups,
+                df_quantile=float(df_quantile),
+                max_batches=max_batches,
+                collect_gradients=gradients_flag,
+            )
+            if block_stats is not None:
+                return block_stats
+            print('Falling back to legacy activation statistics collection for transformer model.')
+
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     handles = []
 
@@ -1265,12 +1652,38 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
             grad_power=args.neuronrank_grad_power,
             grad_mix=args.neuronrank_grad_mix,
             grad_normalise_doc_freq=args.neuronrank_class_normalise,
+            target_sparsity=args.target_sparsity,
+            structured_first=args.structured_first,
+            prune_attn_heads=args.prune_attn_heads,
+            prune_mlp_channels=args.prune_mlp_channels,
+            prune_embeddings=args.prune_embeddings,
+            prune_lm_head=args.prune_lm_head,
+            global_topk=args.global_topk,
+            structured_ratio=args.structured_ratio,
+            grad_spice=args.grad_spice,
         )
     else:
+        prune_kwargs = {
+            'activation_stats': activation_stats,
+            'structured_first': args.structured_first,
+            'target_sparsity': args.target_sparsity,
+            'structured_ratio': args.structured_ratio,
+            'prune_attn_heads': args.prune_attn_heads,
+            'prune_mlp_channels': args.prune_mlp_channels,
+            'prune_embeddings': args.prune_embeddings,
+            'prune_lm_head': args.prune_lm_head,
+            'global_topk': args.global_topk,
+            'weight_power': args.neuronrank_weight_power,
+            'tf_power': args.neuronrank_tf_power,
+            'idf_power': args.neuronrank_idf_power,
+            'idf_add': args.neuronrank_idf_add,
+            'idf_smooth': args.neuronrank_idf_smooth,
+            'grad_spice': args.grad_spice,
+        }
         if target_percentile is not None:
-            model.prune_by_percentile(target_percentile)
+            model.prune_by_percentile(target_percentile, **prune_kwargs)
         else:
-            model.prune_by_std(args.sensitivity)
+            model.prune_by_std(args.sensitivity, **prune_kwargs)
 
     sparsity_stats = util.collect_nonzero_stats(model)
     eval_after_pruning = evaluate_model()
