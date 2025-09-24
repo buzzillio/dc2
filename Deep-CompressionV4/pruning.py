@@ -887,6 +887,35 @@ def build_weight_mask_map(mdl: nn.Module) -> Dict[str, torch.Tensor]:
     return mapping
 
 
+def apply_masks_to_parameters(
+    mdl: nn.Module,
+    masks: Dict[str, torch.Tensor],
+    optimizer: Optional[optim.Optimizer] = None,
+) -> None:
+    """Clamp pruned parameters (and optimizer state) to zero."""
+
+    if not masks:
+        return
+
+    for name, param in mdl.named_parameters():
+        mask = masks.get(name)
+        if mask is None:
+            continue
+
+        mask_tensor = mask.to(device=param.data.device, dtype=param.data.dtype)
+        param.data.mul_(mask_tensor)
+
+        if optimizer is None:
+            continue
+
+        state = optimizer.state.get(param)
+        if not state:
+            continue
+        for value in state.values():
+            if torch.is_tensor(value) and value.shape == param.data.shape:
+                value.mul_(mask_tensor)
+
+
 def create_optimizer():
     if args.model in ('vgg', 'squeezenet'):
         return optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -919,6 +948,7 @@ def train_model(
 
     baseline_alive = None
     if mask_grad:
+        apply_masks_to_parameters(model, weight_masks)
         baseline_alive = util.collect_nonzero_stats(model)['alive']
 
     for epoch in range(epochs):
@@ -957,17 +987,9 @@ def train_model(
             optimizer.step()
 
             if mask_grad and weight_masks:
-                for name, param in model.named_parameters():
-                    mask = weight_masks.get(name)
-                    if mask is None:
-                        continue
-                    param.data.mul_(mask)
-                    state = optimizer.state.get(param)
-                    if not state:
-                        continue
-                    for value in state.values():
-                        if torch.is_tensor(value) and value.shape == param.data.shape:
-                            value.mul_(mask)
+
+                apply_masks_to_parameters(model, weight_masks, optimizer)
+
 
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
@@ -1595,6 +1617,7 @@ def load_model_for_pruning(checkpoint_path: str):
     if eval_criterion is not None:
         eval_criterion.to(device)
     weight_masks = build_weight_mask_map(model)
+    apply_masks_to_parameters(model, weight_masks)
     return checkpoint
 
 
@@ -1742,6 +1765,9 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
         else:
             model.prune_by_std(args.sensitivity, **prune_kwargs)
 
+    weight_masks = build_weight_mask_map(model)
+    apply_masks_to_parameters(model, weight_masks)
+
     sparsity_stats = util.collect_nonzero_stats(model)
     eval_after_pruning = evaluate_model()
     maybe_log_metric('after_pruning', eval_after_pruning)
@@ -1756,6 +1782,7 @@ def prune_and_retrain(activation_stats: Optional[Dict]):
     if retrain_epochs and retrain_epochs > 0:
         print('--- Retraining ---')
         weight_masks = build_weight_mask_map(model)
+        apply_masks_to_parameters(model, weight_masks)
         optimizer = create_optimizer()
         retrain_time_info = train_model(
             retrain_epochs,
