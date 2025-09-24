@@ -987,7 +987,9 @@ def train_model(
             optimizer.step()
 
             if mask_grad and weight_masks:
+
                 apply_masks_to_parameters(model, weight_masks, optimizer)
+
 
             # Update progress bar description every batch for better visibility
             if args.model in ('gpt2', 'nanogpt'):
