@@ -62,14 +62,16 @@ def load_model(
 ) -> ModelBundle:
     """Load a Hugging Face classification model and locate its classifier."""
 
+
+
     model = AutoModelForImageClassification.from_pretrained(hf_model_id)
+
     model.to(device)
     model.eval()
 
     classifier_name, classifier = _find_classifier(model)
     feature_dim = classifier.in_features
 
-    target_num_classes = num_classes if num_classes is not None else model.config.num_labels
     if classifier.out_features != target_num_classes:
         new_classifier = nn.Linear(feature_dim, target_num_classes)
         new_classifier.to(classifier.weight.device)
