@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, cast
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,9 @@ try:  # pragma: no cover - import shim for direct script execution
     from .eval.metrics import evaluate_topk
     from .models import ModelBundle, load_model
     from .pruning import mask, scoring
+
+    from .pruning.hooks import StatisticsMode
+
     from .utils.logging import CSVLogger, MetricRow
     from .utils.seed import resolve_seed, set_seed
 except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
@@ -29,6 +32,10 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         from neronrank.eval.metrics import evaluate_topk
         from neronrank.models import ModelBundle, load_model
         from neronrank.pruning import mask, scoring
+
+        from neronrank.pruning.hooks import StatisticsMode
+
+
         from neronrank.utils.logging import CSVLogger, MetricRow
         from neronrank.utils.seed import resolve_seed, set_seed
     else:  # re-raise unexpected import errors inside the package
@@ -159,18 +166,22 @@ def compute_scores(
     scores: Dict[str, torch.Tensor] = {}
 
     if method == "MB":
-        base = scoring.magnitude_scores(base_bundle.classifier)
         for mode in statistics_mode:
-            scores[mode] = base
+            stats_mode = cast(StatisticsMode, mode)
+            scores[mode] = scoring.magnitude_scores(
+                base_bundle.classifier,
+                mode=stats_mode,
+            )
     elif method == "NR":
-        stats_mode = "all" if len(statistics_mode) > 1 else statistics_mode[0]
+        raw_mode = "all" if len(statistics_mode) > 1 else statistics_mode[0]
+        stats_mode = cast(StatisticsMode, raw_mode)
         scores = scoring.neuronrank_scores(
             base_bundle.model,
             base_bundle.classifier,
             base_bundle.classifier,
             loaders.calibration,
             device,
-            stats_mode,  # type: ignore[arg-type]
+            stats_mode,
             alpha=args.tfidf_alpha,
             beta=args.tfidf_beta,
             gamma=args.tfidf_gamma,
