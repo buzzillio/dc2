@@ -332,7 +332,7 @@ python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_pa
   zero‑shot acc, +1‑epoch acc, score_time_s, ft_epoch_time_s, kept_params.
 - **Figure**: Accuracy vs Parameter Count (two series: zero‑shot and +FT).
 
-At **high sparsity (≥0.8–0.95)**, **NR should clearly outperform MB**; keep all rows even if 95% is ugly (you can omit it from the paper).
+At **high sparsity (≥0.8–0.95)**, **NR should clearly outperform MB**; We keep all rows even if on high sparcity results are not nice.
 
 ---
 
