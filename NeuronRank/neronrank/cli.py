@@ -99,7 +99,7 @@ def finetune(
         weight_decay=weight_decay,
     )
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler(device.type, enabled=amp and device.type == "cuda")
 
     epoch_durations: List[float] = []
 
@@ -109,7 +109,7 @@ def finetune(
             inputs = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
+            with torch.amp.autocast(device.type, enabled=amp and device.type == "cuda"):
                 outputs = model(inputs)
                 if isinstance(outputs, dict):
                     logits = outputs["logits"]
