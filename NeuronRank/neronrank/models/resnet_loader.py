@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForImageClassification
+from transformers import AutoConfig, AutoModelForImageClassification
 
 
 @dataclass
@@ -64,13 +64,24 @@ def load_model(
 
 
 
-    model = AutoModelForImageClassification.from_pretrained(hf_model_id)
+    config = AutoConfig.from_pretrained(hf_model_id, trust_remote_code=True)
+    # Respect an explicit number of classes while retaining pretrained weights when possible.
+    if num_classes is not None:
+        config.num_labels = num_classes
+
+    model = AutoModelForImageClassification.from_pretrained(
+        hf_model_id,
+        config=config,
+        trust_remote_code=True,
+    )
 
     model.to(device)
     model.eval()
 
     classifier_name, classifier = _find_classifier(model)
     feature_dim = classifier.in_features
+
+    target_num_classes = num_classes or getattr(model.config, "num_labels", classifier.out_features)
 
     if classifier.out_features != target_num_classes:
         new_classifier = nn.Linear(feature_dim, target_num_classes)
