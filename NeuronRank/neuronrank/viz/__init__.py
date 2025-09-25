@@ -1,5 +1,6 @@
 """Visualization helpers."""
 
-from .plots import main as plot_main
+from .plots import create_plot, main as plot_main
 
-__all__ = ["plot_main"]
+__all__ = ["plot_main", "create_plot"]
+

@@ -65,6 +65,16 @@ class ChannelTarget:
     out_channels: int
 
 
+
+@dataclass(frozen=True)
+class ChannelFootprint:
+    """Accounting helper describing parameters controlled by a target."""
+
+    per_channel_params: int
+    total_params: int
+
+
+
 def _get_module(root: nn.Module, name: str) -> nn.Module:
     module: nn.Module = root
     if name == "":
@@ -174,6 +184,51 @@ def discover_resnet_targets(model: nn.Module, classifier_name: str) -> List[Chan
             )
 
     return targets
+
+
+def _conv_kernel_area(conv: nn.Conv2d) -> int:
+    kernel_size = conv.kernel_size
+    if isinstance(kernel_size, tuple):
+        return int(kernel_size[0] * kernel_size[1])
+    return int(kernel_size) * int(kernel_size)
+
+
+def _conv_output_params_per_channel(conv: nn.Conv2d) -> int:
+    area = _conv_kernel_area(conv)
+    group_in_channels = conv.in_channels // conv.groups
+    params = group_in_channels * area
+    if conv.bias is not None:
+        params += 1
+    return int(params)
+
+
+def _conv_input_params_per_channel(conv: nn.Conv2d) -> int:
+    area = _conv_kernel_area(conv)
+    group_out_channels = conv.out_channels // conv.groups
+    params = group_out_channels * area
+    return int(params)
+
+
+def compute_target_footprint(model: nn.Module, target: ChannelTarget) -> ChannelFootprint:
+    """Estimate the parameter footprint controlled by a target block."""
+
+    conv: nn.Conv2d = _get_module(model, target.conv)  # type: ignore[assignment]
+    per_channel = _conv_output_params_per_channel(conv)
+
+    if target.downsample_conv is not None:
+        down_conv: nn.Conv2d = _get_module(model, target.downsample_conv)  # type: ignore[assignment]
+        per_channel += _conv_output_params_per_channel(down_conv)
+
+    if target.next_conv is not None:
+        next_module = _get_module(model, target.next_conv)
+        if isinstance(next_module, nn.Conv2d):
+            per_channel += _conv_input_params_per_channel(next_module)
+        elif isinstance(next_module, nn.Linear):
+            per_channel += int(next_module.out_features)
+
+    total = per_channel * target.out_channels
+    return ChannelFootprint(per_channel_params=int(per_channel), total_params=int(total))
+
 
 
 def _prepare_storage(targets: Iterable[ChannelTarget]) -> Dict[str, Dict[str, torch.Tensor]]:
