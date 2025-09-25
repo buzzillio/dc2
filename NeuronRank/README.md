@@ -59,14 +59,14 @@ pip install transformers datasets timm pandas matplotlib scipy tqdm
 
 ```
 dc2/
-└─ NeronRank/
+└─ NeuronRank/
    ├─ README.md                         # this file
    ├─ requirements.txt                  # optional; pin later
    ├─ scripts/
    │   ├─ run_resnet_cifar10.sh         # single-command sanity run (CUDA)
    │   ├─ run_resnet_imagenet.sh        # if you have ImageNet val locally
    │   └─ plot_results.sh               # convenience wrapper for plotting
-   └─ neronrank/
+   └─ neuronrank/
        ├─ __init__.py
        ├─ cli.py                        # main entrypoint (argparse)
        ├─ config.py                     # default config, seeds
@@ -126,12 +126,12 @@ This mapping (channel ↔ fc input) is 1:1 in standard ResNet: `avgpool(mean)` o
 
 **Primary entrypoint:**
 ```bash
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id edadaltocg/resnet18_cifar10 \
   --dataset cifar10 \
   --methods NR,MB,FO \
   --statistics before \
-  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95 \
+  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99 \
   --recover-epochs 1 \
   --calib-size 4096 \
   --batch-size 128 \
@@ -152,13 +152,13 @@ python -m neronrank.cli \
 
 **Run on ImageNet‑val with ResNet‑50:**
 ```bash
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id timm/resnet50.a1_in1k \
   --dataset imagenet \
   --imagenet-val /path/imagenet/val \
   --methods NR,MB,FO \
   --statistics before \
-  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95 \
+  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99 \
   --recover-epochs 1 \
   --calib-size 4096 \
   --batch-size 256 \
@@ -172,7 +172,7 @@ python -m neronrank.cli \
 - `--dataset {cifar10|imagenet}` and `--imagenet-val <path>` if ImageNet.  
 - `--methods {NR,MB,FO}` comma‑sep.  
 - `--statistics {before|post|all}` (default: `before`).  
-- `--sparsities` : comma‑sep list of neuron pruning ratios (0–0.95).  
+- `--sparsities` : comma‑sep list of neuron pruning ratios (0–0.99 supported; defaults include fine 0.96–0.99 steps).
 - `--calib-size` : #samples for stats (NR/FO) and timers.  
 - `--recover-epochs` : epochs for short FT (0 to disable; default 1).  
 - `--batch-size`, `--lr`, `--wd` : training knobs.  
@@ -220,9 +220,10 @@ Each scorer returns `scores`, `score_time_seconds`, `peak_mem_mb` (use `torch.cu
 - **Zero‑shot**: evaluate immediately after pruning.  
 - **+FT (1 epoch)**: if `--recover-epochs > 0`, run one epoch (SGD/AdamW) and re‑evaluate.  
 - Measure:
-  - `zero_shot_acc_top1`, `zero_shot_eval_time_s`  
-  - `ft_acc_top1`, `ft_total_time_s`, `ft_epoch_time_avg_s`  
-  - `kept_params` (after structural pruning)
+  - `zero_shot_acc_top1`, `zero_shot_eval_time_s`
+  - `ft_acc_top1`, `ft_total_time_s`, `ft_epoch_time_avg_s`
+  - `kept_params` (connections kept within the pruned scope)
+  - `compression_rate` (kept ÷ original connections for that scope)
 
 ### 6) CSV logging (`utils/logging.py`)
 
@@ -239,7 +240,8 @@ Row per (method × statistics × sparsity):
 | method | MB / NR / FO |
 | statistics | before / post |
 | sparsity | float (e.g., 0.7) |
-| kept_params | int |
+| kept_params | int (connections remaining in the pruned scope) |
+| compression_rate | float (kept_params / original_scope_params) |
 | zero_shot_acc_top1 | float |
 | zero_shot_eval_time_s | float |
 | score_time_s | float |
@@ -253,9 +255,9 @@ Row per (method × statistics × sparsity):
 Saved to: `--output-dir/metrics.csv`
 
 ### 7) Plots (`viz/plots.py`)
-- **Accuracy vs Parameter Count**: one line per method (MB, NR, FO), for the chosen `--statistics` mode.  
-  - X = `kept_params`, Y = `accuracy` (zero‑shot and FT as separate markers or styles).  
-  - Output: `--output-dir/acc_vs_params.png`
+- **Accuracy vs Parameter Count**: one line per method (MB, NR, FO), for the chosen `--statistics` mode.
+  - X = `kept_params` (in millions), Y = `accuracy` (zero‑shot and FT as separate markers or styles).
+  - Outputs: `--output-dir/acc_vs_params.png` plus per‑statistics variants (e.g. `acc_vs_params_post.png`).
 
 ---
 
@@ -267,12 +269,12 @@ Saved to: `--output-dir/metrics.csv`
 set -euo pipefail
 
 OUT="runs/resnet18-cifar10"
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id edadaltocg/resnet18_cifar10 \
   --dataset cifar10 \
   --methods NR,MB,FO \
   --statistics before \
-  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95 \
+  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99 \
   --calib-size 4096 \
   --batch-size 128 \
   --recover-epochs 1 \
@@ -280,7 +282,8 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+# CLI auto-saves plots; rerun manually for custom filters:
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
 ```
 
 ### `scripts/run_resnet_imagenet.sh`
@@ -291,13 +294,13 @@ set -euo pipefail
 IMNET_VAL="/path/to/imagenet/val"
 OUT="runs/resnet50-imagenet"
 
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id timm/resnet50.a1_in1k \
   --dataset imagenet \
   --imagenet-val "${IMNET_VAL}" \
   --methods NR,MB,FO \
   --statistics before \
-  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95 \
+  --sparsities 0.3,0.5,0.7,0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99 \
   --calib-size 4096 \
   --batch-size 256 \
   --recover-epochs 1 \
@@ -305,17 +308,18 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+# CLI auto-saves plots; rerun manually for custom filters:
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
 ```
 
 ---
 
 ## Validation strategy
 
-1) **Sanity (CIFAR‑10, ResNet‑18)**  
-   - Run MB / NR / FO at sparsities `0.3, 0.5, 0.7, 0.8, 0.9, 0.95`.  
-   - Compare **zero‑shot** and **+1 epoch FT** accuracy; ensure CSV is populated.  
-   - Confirm plot `acc_vs_params.png` exists.
+1) **Sanity (CIFAR‑10, ResNet‑18)**
+   - Run MB / NR / FO at sparsities `0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.99`.
+   - Compare **zero‑shot** and **+1 epoch FT** accuracy; ensure CSV is populated.
+   - Confirm plots `acc_vs_params.png` and `acc_vs_params_post.png` (if applicable) exist.
 
 2) **Optional ImageNet‑val (ResNet‑50)**  
    - Repeat with `timm/resnet50.a1_in1k` and local val path.
@@ -328,8 +332,8 @@ python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_pa
 
 ## What to report
 
-- **Table**: per method (MB, NR, FO) and sparsity:  
-  zero‑shot acc, +1‑epoch acc, score_time_s, ft_epoch_time_s, kept_params.
+- **Table**: per method (MB, NR, FO) and sparsity:
+  zero‑shot acc, +1‑epoch acc, score_time_s, ft_epoch_time_s, kept_params, compression_rate.
 - **Figure**: Accuracy vs Parameter Count (two series: zero‑shot and +FT).
 
 At **high sparsity (≥0.8–0.95)**, **NR should clearly outperform MB**; We keep all rows even if on high sparcity results are not nice.
