@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModelForImageClassification
+from transformers import AutoModelForImageClassification
 
 
 @dataclass
@@ -62,12 +62,10 @@ def load_model(
 ) -> ModelBundle:
     """Load a Hugging Face classification model and locate its classifier."""
 
-    config = AutoConfig.from_pretrained(hf_model_id)
-    target_num_classes = num_classes if num_classes is not None else config.num_labels
-    if config.num_labels != target_num_classes:
-        config.num_labels = target_num_classes
 
-    model = AutoModelForImageClassification.from_pretrained(hf_model_id, config=config)
+
+    model = AutoModelForImageClassification.from_pretrained(hf_model_id)
+
     model.to(device)
     model.eval()
 
