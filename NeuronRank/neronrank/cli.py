@@ -190,7 +190,13 @@ def run(args: argparse.Namespace) -> None:
         imagenet_val=args.imagenet_val,
     )
 
-    base_bundle = load_model(args.hf_model_id, device, use_cuda=args.cuda, num_classes=loaders.num_classes)
+    base_bundle = load_model(
+        args.hf_model_id,
+        device,
+        use_cuda=args.cuda,
+        num_classes=loaders.num_classes,
+        dataset_hint=args.dataset,
+    )
     base_bundle.model.to(device)
 
     metrics_path = args.output_dir / "metrics.csv"
