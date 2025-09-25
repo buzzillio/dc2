@@ -29,19 +29,19 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         package_root = Path(__file__).resolve().parent.parent
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
-        from neronrank.config import ExperimentConfig, parse_methods, parse_sparsities
-        from neronrank.data import DatasetBundle, get_dataset
-        from neronrank.eval.metrics import evaluate_topk
-        from neronrank.models import ModelBundle, load_model
-        from neronrank.pruning import channel, mask, scoring
+        from neuronrank.config import ExperimentConfig, parse_methods, parse_sparsities
+        from neuronrank.data import DatasetBundle, get_dataset
+        from neuronrank.eval.metrics import evaluate_topk
+        from neuronrank.models import ModelBundle, load_model
+        from neuronrank.pruning import channel, mask, scoring
 
 
-        from neronrank.pruning.hooks import StatisticsMode
+        from neuronrank.pruning.hooks import StatisticsMode
 
 
 
-        from neronrank.utils.logging import CSVLogger, MetricRow
-        from neronrank.utils.seed import resolve_seed, set_seed
+        from neuronrank.utils.logging import CSVLogger, MetricRow
+        from neuronrank.utils.seed import resolve_seed, set_seed
     else:  # re-raise unexpected import errors inside the package
         raise
 
@@ -173,12 +173,9 @@ def compute_classifier_scores(
     scores: Dict[str, torch.Tensor] = {}
 
     if method == "MB":
+        base = scoring.magnitude_scores(base_bundle.classifier)
         for mode in statistics_mode:
-            stats_mode = cast(StatisticsMode, mode)
-            scores[mode] = scoring.magnitude_scores(
-                base_bundle.classifier,
-                mode=stats_mode,
-            )
+            scores[mode] = base
     elif method == "NR":
         raw_mode = "all" if len(statistics_mode) > 1 else statistics_mode[0]
         stats_mode = cast(StatisticsMode, raw_mode)

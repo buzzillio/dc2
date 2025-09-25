@@ -59,14 +59,14 @@ pip install transformers datasets timm pandas matplotlib scipy tqdm
 
 ```
 dc2/
-└─ NeronRank/
+└─ NeuronRank/
    ├─ README.md                         # this file
    ├─ requirements.txt                  # optional; pin later
    ├─ scripts/
    │   ├─ run_resnet_cifar10.sh         # single-command sanity run (CUDA)
    │   ├─ run_resnet_imagenet.sh        # if you have ImageNet val locally
    │   └─ plot_results.sh               # convenience wrapper for plotting
-   └─ neronrank/
+   └─ neuronrank/
        ├─ __init__.py
        ├─ cli.py                        # main entrypoint (argparse)
        ├─ config.py                     # default config, seeds
@@ -126,7 +126,7 @@ This mapping (channel ↔ fc input) is 1:1 in standard ResNet: `avgpool(mean)` o
 
 **Primary entrypoint:**
 ```bash
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id edadaltocg/resnet18_cifar10 \
   --dataset cifar10 \
   --methods NR,MB,FO \
@@ -152,7 +152,7 @@ python -m neronrank.cli \
 
 **Run on ImageNet‑val with ResNet‑50:**
 ```bash
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id timm/resnet50.a1_in1k \
   --dataset imagenet \
   --imagenet-val /path/imagenet/val \
@@ -267,7 +267,7 @@ Saved to: `--output-dir/metrics.csv`
 set -euo pipefail
 
 OUT="runs/resnet18-cifar10"
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id edadaltocg/resnet18_cifar10 \
   --dataset cifar10 \
   --methods NR,MB,FO \
@@ -280,7 +280,7 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
 ```
 
 ### `scripts/run_resnet_imagenet.sh`
@@ -291,7 +291,7 @@ set -euo pipefail
 IMNET_VAL="/path/to/imagenet/val"
 OUT="runs/resnet50-imagenet"
 
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id timm/resnet50.a1_in1k \
   --dataset imagenet \
   --imagenet-val "${IMNET_VAL}" \
@@ -305,7 +305,7 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
 ```
 
 ---

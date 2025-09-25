@@ -15,7 +15,7 @@ if [[ ! -d "${IMNET_VAL}" ]]; then
   exit 1
 fi
 
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id timm/resnet50.a1_in1k \
   --dataset imagenet \
   --imagenet-val "${IMNET_VAL}" \
@@ -29,4 +29,4 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
