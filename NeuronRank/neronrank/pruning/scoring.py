@@ -53,6 +53,9 @@ def _project_post_activations(
     if acts.dim() != 2:
         acts = acts.flatten(start_dim=1)
 
+    if weight_abs.device != acts.device:
+        weight_abs = weight_abs.to(acts.device)
+
     out_features, in_features = weight_abs.shape
     if acts.shape[1] != out_features:
         raise RuntimeError(
