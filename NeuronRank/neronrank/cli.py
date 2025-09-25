@@ -284,20 +284,8 @@ def run(args: argparse.Namespace) -> None:
                 kept_params = mask.count_parameters(pruned_bundle.model)
                 zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
 
-                ft_acc, ft_total_time, ft_epoch_avg = finetune(
-                    pruned_bundle,
-                    loaders,
-                    device,
-                    args.recover_epochs,
-                    args.lr,
-                    args.weight_decay,
-                    args.momentum,
-                    args.amp,
-                    args.log_interval,
-                )
-
                 timestamp = datetime.utcnow().isoformat()
-                row = MetricRow(
+                row_data = dict(
                     timestamp=timestamp,
                     seed=seed,
                     device=str(device),
@@ -312,13 +300,33 @@ def run(args: argparse.Namespace) -> None:
                     zero_shot_eval_time_s=eval_time,
                     score_time_s=score_time,
                     score_peak_mem_mb=peak_mem,
-                    ft_epochs=args.recover_epochs,
-                    ft_epoch_time_avg_s=ft_epoch_avg,
-                    ft_total_time_s=ft_total_time,
-                    ft_acc_top1=ft_acc,
+                    ft_epochs=0,
+                    ft_epoch_time_avg_s=0.0,
+                    ft_total_time_s=0.0,
+                    ft_acc_top1=float("nan"),
                     notes=args.notes,
                 )
-                logger.log(row)
+                logger.log(MetricRow(**row_data))
+
+                if args.recover_epochs > 0:
+                    ft_acc, ft_total_time, ft_epoch_avg = finetune(
+                        pruned_bundle,
+                        loaders,
+                        device,
+                        args.recover_epochs,
+                        args.lr,
+                        args.weight_decay,
+                        args.momentum,
+                        args.amp,
+                        args.log_interval,
+                    )
+                    row_data.update(
+                        ft_epochs=args.recover_epochs,
+                        ft_acc_top1=ft_acc,
+                        ft_total_time_s=ft_total_time,
+                        ft_epoch_time_avg_s=ft_epoch_avg,
+                    )
+                    logger.log(MetricRow(**row_data))
                 print(
                     f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
                     flush=True,
