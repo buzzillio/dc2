@@ -11,13 +11,28 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 
-from .config import ExperimentConfig, parse_methods, parse_sparsities
-from .data import DatasetBundle, get_dataset
-from .eval.metrics import evaluate_topk
-from .models import ModelBundle, load_model
-from .pruning import mask, scoring
-from .utils.logging import CSVLogger, MetricRow
-from .utils.seed import resolve_seed, set_seed
+try:  # pragma: no cover - import shim for direct script execution
+    from .config import ExperimentConfig, parse_methods, parse_sparsities
+    from .data import DatasetBundle, get_dataset
+    from .eval.metrics import evaluate_topk
+    from .models import ModelBundle, load_model
+    from .pruning import mask, scoring
+    from .utils.logging import CSVLogger, MetricRow
+    from .utils.seed import resolve_seed, set_seed
+except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
+    if __package__ in (None, ""):
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from neronrank.config import ExperimentConfig, parse_methods, parse_sparsities
+        from neronrank.data import DatasetBundle, get_dataset
+        from neronrank.eval.metrics import evaluate_topk
+        from neronrank.models import ModelBundle, load_model
+        from neronrank.pruning import mask, scoring
+        from neronrank.utils.logging import CSVLogger, MetricRow
+        from neronrank.utils.seed import resolve_seed, set_seed
+    else:  # re-raise unexpected import errors inside the package
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
