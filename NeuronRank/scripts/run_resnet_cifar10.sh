@@ -15,5 +15,7 @@ python -m neuronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
+
 # CLI auto-saves plots; rerun manually for custom filters:
+
 python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"

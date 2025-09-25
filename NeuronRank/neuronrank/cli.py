@@ -6,7 +6,9 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
 from typing import Dict, List, Sequence, Tuple, cast
+
 
 import torch
 import torch.nn as nn
@@ -46,9 +48,11 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         raise
 
 
+
 def _default_output_dir() -> Path:
     package_root = Path(__file__).resolve().parent.parent
     return (package_root / ExperimentConfig.output_dir).resolve()
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,7 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sparsities",
         type=parse_sparsities,
-        default=parse_sparsities("0.3,0.5,0.7,0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99"),
+
+        default=parse_sparsities("0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99"),
+
     )
     parser.add_argument("--seed", type=int, default=ExperimentConfig.seed)
     parser.add_argument("--batch-size", type=int, default=ExperimentConfig.batch_size)
@@ -72,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=ExperimentConfig.lr)
     parser.add_argument("--weight-decay", type=float, default=ExperimentConfig.weight_decay)
     parser.add_argument("--momentum", type=float, default=ExperimentConfig.momentum)
+
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -81,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"Defaults to '{ExperimentConfig.output_dir}' under the repository root."
         ),
     )
+
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--tfidf-alpha", type=float, default=ExperimentConfig.tfidf_alpha)
@@ -103,10 +111,12 @@ def prepare_output_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+
 def _classifier_footprint(linear: nn.Linear) -> Tuple[int, int]:
     per_feature = int(linear.out_features)
     total = per_feature * int(linear.in_features)
     return per_feature, total
+
 
 
 def compute_statistics_modes(statistics: str) -> List[str]:
@@ -278,8 +288,10 @@ def compute_channel_scores(
 
 
 def run(args: argparse.Namespace) -> None:
+
     if not args.output_dir.is_absolute():
         args.output_dir = args.output_dir.resolve()
+
     prepare_output_dir(args.output_dir)
     device = determine_device(args.cuda)
     seed = resolve_seed(args.seed)
@@ -335,6 +347,7 @@ def run(args: argparse.Namespace) -> None:
         channel_targets = channel.discover_resnet_targets(
             base_bundle.model, base_bundle.classifier_name
         )
+
     classifier_per_feature: Tuple[int, int] | None = None
     if args.scope == "fc":
         classifier_per_feature = _classifier_footprint(base_bundle.classifier)
@@ -344,6 +357,7 @@ def run(args: argparse.Namespace) -> None:
             target.name: channel.compute_target_footprint(base_bundle.model, target)
             for target in channel_targets
         }
+
 
     for method in args.methods:
         print(f"[NeuronRank] Computing scores with method={method}…", flush=True)
@@ -375,6 +389,7 @@ def run(args: argparse.Namespace) -> None:
                     pruned_bundle = mask.apply_pruning(base_bundle, keep_indices)
                     pruned_bundle.model.to(device)
 
+
                     kept_features = len(keep_indices)
                     assert (
                         classifier_per_feature is not None
@@ -386,6 +401,7 @@ def run(args: argparse.Namespace) -> None:
                         if total_considered > 0
                         else 1.0
                     )
+
                     zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
 
                     timestamp = datetime.utcnow().isoformat()
@@ -408,7 +424,9 @@ def run(args: argparse.Namespace) -> None:
                         ft_epoch_time_avg_s=0.0,
                         ft_total_time_s=0.0,
                         ft_acc_top1=float("nan"),
+
                         compression_rate=compression,
+
                         notes=args.notes,
                     )
                     logger.log(MetricRow(**row_data))
@@ -432,10 +450,12 @@ def run(args: argparse.Namespace) -> None:
                             ft_epoch_time_avg_s=ft_epoch_avg,
                         )
                         logger.log(MetricRow(**row_data))
+
                         print(
                             f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
                             flush=True,
                         )
+
             else:
                 for target in channel_targets:
                     layer_scores = scores[target.name]
@@ -455,10 +475,13 @@ def run(args: argparse.Namespace) -> None:
                         keep_indices = channel.plan_layer_keep_indices(
                             layer_scores, sparsity, target.max_sparsity
                         )
+
                         pruned_bundle, _ = channel.apply_structured_pruning(
+
                             base_bundle, target, keep_indices
                         )
                         pruned_bundle.model.to(device)
+
 
                         footprint = target_footprints[target.name]
                         kept_channels = len(keep_indices)
@@ -468,6 +491,7 @@ def run(args: argparse.Namespace) -> None:
                             if footprint.total_params > 0
                             else 1.0
                         )
+
 
                         zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
 
@@ -482,7 +506,9 @@ def run(args: argparse.Namespace) -> None:
                             method=method,
                             statistics=stats_mode,
                             sparsity=effective,
+
                             kept_params=kept_block_params,
+
                             zero_shot_acc_top1=zero_acc,
                             zero_shot_eval_time_s=eval_time,
                             score_time_s=score_time,
@@ -492,6 +518,7 @@ def run(args: argparse.Namespace) -> None:
                             ft_total_time_s=0.0,
                             ft_acc_top1=float("nan"),
                             compression_rate=compression,
+
                             notes=args.notes,
                         )
                         logger.log(MetricRow(**row_data))
@@ -523,6 +550,7 @@ def run(args: argparse.Namespace) -> None:
                         )
 
 
+
     try:
         from .viz.plots import create_plot
 
@@ -538,6 +566,7 @@ def run(args: argparse.Namespace) -> None:
             )
     except Exception as exc:  # pragma: no cover - plotting is optional
         print(f"[NeuronRank] Plotting skipped: {exc}", file=sys.stderr, flush=True)
+
 
 def main() -> None:
     parser = build_parser()

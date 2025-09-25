@@ -27,7 +27,9 @@ class MetricRow:
     ft_epoch_time_avg_s: float
     ft_total_time_s: float
     ft_acc_top1: float
+
     compression_rate: float
+
     notes: str = ""
 
 

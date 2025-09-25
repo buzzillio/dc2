@@ -21,9 +21,6 @@ class ExperimentConfig:
     statistics: str = "before"
     sparsities: List[float] = field(
         default_factory=lambda: [
-            0.3,
-            0.5,
-            0.7,
             0.8,
             0.9,
             0.95,
@@ -34,6 +31,7 @@ class ExperimentConfig:
             0.985,
             0.99,
         ]
+
     )
     hf_model_id: str = "edadaltocg/resnet18_cifar10"
     dataset: str = "cifar10"
