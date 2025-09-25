@@ -211,34 +211,53 @@ def compute_classifier_scores(
 
 def compute_channel_scores(
     method: str,
+    statistics_modes: Sequence[str],
     base_bundle: ModelBundle,
     targets: Sequence[channel.ChannelTarget],
     loaders: DatasetBundle,
     device: torch.device,
     args: argparse.Namespace,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, Dict[str, torch.Tensor]]:
     method = method.upper()
+    results: Dict[str, Dict[str, torch.Tensor]] = {}
+
     if method == "MB":
-        return channel.compute_magnitude_scores(base_bundle.model, targets)
+        base_scores = channel.compute_magnitude_scores(base_bundle.model, targets)
+        for mode in statistics_modes:
+            results[mode] = {name: tensor.clone() for name, tensor in base_scores.items()}
+        return results
+
     if method == "NR":
-        return channel.compute_neuronrank_scores(
+        raw_mode = "all" if len(statistics_modes) > 1 else statistics_modes[0]
+        stats_mode = cast(StatisticsMode, raw_mode)
+        nr_scores = channel.compute_neuronrank_scores(
             base_bundle.model,
             targets,
             loaders.calibration,
             device,
+            stats_mode,
             alpha=args.tfidf_alpha,
             beta=args.tfidf_beta,
             gamma=args.tfidf_gamma,
             limit=args.calib_size,
         )
+        for key, value in nr_scores.items():
+            if key in statistics_modes:
+                results[key] = value
+        return results
+
     if method == "FO":
-        return channel.compute_first_order_scores(
+        base_scores = channel.compute_first_order_scores(
             base_bundle.model,
             targets,
             loaders.calibration,
             device,
             limit=args.calib_size,
         )
+        for mode in statistics_modes:
+            results[mode] = {name: tensor.clone() for name, tensor in base_scores.items()}
+        return results
+
     raise ValueError(f"Unknown method: {method}")
 
 
@@ -295,13 +314,6 @@ def run(args: argparse.Namespace) -> None:
     statistics_modes = compute_statistics_modes(args.statistics)
     channel_targets: List[channel.ChannelTarget] = []
     if args.scope == "all":
-        if statistics_modes != ["post"]:
-            print(
-                "[NeuronRank] Warning: --scope all supports only post statistics; "
-                "overriding --statistics to 'post'",
-                flush=True,
-            )
-            statistics_modes = ["post"]
         channel_targets = channel.discover_resnet_targets(
             base_bundle.model, base_bundle.classifier_name
         )
@@ -316,11 +328,9 @@ def run(args: argparse.Namespace) -> None:
                 method, statistics_modes, base_bundle, loaders, device, args
             )
         else:
-            score_tensors = {
-                "post": compute_channel_scores(
-                    method, base_bundle, channel_targets, loaders, device, args
-                )
-            }
+            score_tensors = compute_channel_scores(
+                method, statistics_modes, base_bundle, channel_targets, loaders, device, args
+            )
         score_time = time.time() - score_time_start
         peak_mem = (
             torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else 0.0
@@ -391,11 +401,16 @@ def run(args: argparse.Namespace) -> None:
             else:
                 for target in channel_targets:
                     layer_scores = scores[target.name]
+                    seen_effective: set[float] = set()
                     for sparsity in args.sparsities:
                         effective = min(sparsity, target.max_sparsity)
+                        key = round(effective, 4)
+                        if key in seen_effective:
+                            continue
+                        seen_effective.add(key)
                         print(
-                            "[NeuronRank] Evaluating layer={} sparsity={:.2f} ({})".format(
-                                target.name, effective, method
+                            "[NeuronRank] Evaluating layer={} sparsity={:.2f} ({}|{})".format(
+                                target.name, effective, method, stats_mode
                             ),
                             flush=True,
                         )
@@ -453,8 +468,8 @@ def run(args: argparse.Namespace) -> None:
                             )
                             logger.log(MetricRow(**row_data))
                         print(
-                            "[NeuronRank] Logged results | method={} | layer={} | sparsity={:.2f}".format(
-                                method, target.name, effective
+                            "[NeuronRank] Logged results | method={} | stats={} | layer={} | sparsity={:.2f}".format(
+                                method, stats_mode, target.name, effective
                             ),
                             flush=True,
                         )

@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from ..models.resnet_loader import ModelBundle
+from .hooks import StatisticsMode
 from .mask import build_keep_indices, count_parameters
 
 
@@ -186,37 +187,75 @@ def _prepare_storage(targets: Iterable[ChannelTarget]) -> Dict[str, Dict[str, to
     return storage
 
 
-def collect_post_activation_stats(
+def _activation_hook(
+    storage: Dict[str, Dict[str, torch.Tensor]],
+    name: str,
+    threshold: float,
+):
+    def hook(_module, _inputs, outputs):
+        if isinstance(outputs, tuple):
+            tensor = outputs[0]
+        else:
+            tensor = outputs
+        if tensor.dim() != 4:
+            raise RuntimeError("Expected convolutional activation with 4 dimensions")
+        tensor = tensor.detach().cpu()
+        mean_hw = tensor.abs().mean(dim=(2, 3))
+        storage[name]["tf_sum"] += mean_hw.sum(dim=0)
+        storage[name]["df"] += (mean_hw > threshold).sum(dim=0)
+        storage[name]["count"] += float(mean_hw.shape[0])
+
+    return hook
+
+
+def collect_channel_activation_stats(
     model: nn.Module,
     targets: Sequence[ChannelTarget],
     dataloader,
     device: torch.device,
+    modes: Sequence[str],
     limit: Optional[int] = None,
     threshold: float = 1e-6,
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Collect per-channel activation statistics after ReLU."""
+) -> Dict[str, Dict[str, Dict[str, torch.Tensor]]]:
+    """Collect per-channel activation statistics for the requested modes."""
 
-    storage = _prepare_storage(targets)
+    requested = tuple(dict.fromkeys(modes))
+    if not requested:
+        raise ValueError("At least one statistics mode must be requested")
+
+    for mode in requested:
+        if mode not in ("before", "post"):
+            raise ValueError("Unsupported statistics mode for channel pruning")
+
+    storage_by_mode: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {
+        mode: _prepare_storage(targets) for mode in requested
+    }
 
     handles = []
 
     for target in targets:
-        module = _get_module(model, target.activation)
-
-        def hook(_module, _inputs, outputs, *, name=target.name):
-            if isinstance(outputs, tuple):
-                tensor = outputs[0]
-            else:
-                tensor = outputs
-            if tensor.dim() != 4:
-                raise RuntimeError("Expected convolutional activation with 4 dimensions")
-            tensor = tensor.detach().cpu()
-            mean_hw = tensor.abs().mean(dim=(2, 3))
-            storage[name]["tf_sum"] += mean_hw.sum(dim=0)
-            storage[name]["df"] += (mean_hw > threshold).sum(dim=0)
-            storage[name]["count"] += float(mean_hw.shape[0])
-
-        handles.append(module.register_forward_hook(hook))
+        if "before" in storage_by_mode:
+            if not target.bn:
+                raise RuntimeError(
+                    f"Target '{target.name}' does not define a batch-norm module for 'before' statistics"
+                )
+            module = _get_module(model, target.bn)
+            handles.append(
+                module.register_forward_hook(
+                    _activation_hook(storage_by_mode["before"], target.name, threshold)
+                )
+            )
+        if "post" in storage_by_mode:
+            if not target.activation:
+                raise RuntimeError(
+                    f"Target '{target.name}' does not define an activation module for 'post' statistics"
+                )
+            module = _get_module(model, target.activation)
+            handles.append(
+                module.register_forward_hook(
+                    _activation_hook(storage_by_mode["post"], target.name, threshold)
+                )
+            )
 
     model.eval()
     processed = 0
@@ -232,13 +271,20 @@ def collect_post_activation_stats(
     for handle in handles:
         handle.remove()
 
-    for target in targets:
-        entry = storage[target.name]
-        total = entry["count"].clamp_min(1.0)
-        entry["tf"] = entry["tf_sum"] / total
-        entry["N"] = total
+    results: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {mode: {} for mode in requested}
+    for mode, storage in storage_by_mode.items():
+        mode_results: Dict[str, Dict[str, torch.Tensor]] = {}
+        for target in targets:
+            entry = storage[target.name]
+            total = entry["count"].clamp_min(1.0)
+            mode_results[target.name] = {
+                "tf": entry["tf_sum"] / total,
+                "df": entry["df"].clone(),
+                "N": total.clone(),
+            }
+        results[mode] = mode_results
 
-    return storage
+    return results
 
 
 def compute_magnitude_scores(
@@ -257,22 +303,35 @@ def compute_neuronrank_scores(
     targets: Sequence[ChannelTarget],
     dataloader,
     device: torch.device,
+    mode: StatisticsMode,
     alpha: float,
     beta: float,
     gamma: float,
     limit: Optional[int] = None,
-) -> Dict[str, torch.Tensor]:
-    stats = collect_post_activation_stats(model, targets, dataloader, device, limit)
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    if mode not in ("before", "post", "all"):
+        raise ValueError("mode must be one of {'before', 'post', 'all'}")
+
+    requested = ("before", "post") if mode == "all" else (mode,)
+    stats = collect_channel_activation_stats(
+        model, targets, dataloader, device, requested, limit
+    )
     base = compute_magnitude_scores(model, targets)
-    scores: Dict[str, torch.Tensor] = {}
-    for target in targets:
-        entry = stats[target.name]
-        tf = entry["tf"]
-        df = entry["df"].clamp_min(0.0)
-        total = entry["N"].item()
-        idf = torch.log((total + 1.0) / (df + 1.0))
-        scores[target.name] = (base[target.name] ** alpha) * (tf ** beta) * (idf ** gamma)
-    return scores
+
+    results: Dict[str, Dict[str, torch.Tensor]] = {}
+    for key in requested:
+        per_target: Dict[str, torch.Tensor] = {}
+        for target in targets:
+            entry = stats[key][target.name]
+            tf = entry["tf"].to(base[target.name].dtype)
+            df = entry["df"].clamp_min(0.0).to(base[target.name].dtype)
+            total = float(entry["N"].item())
+            idf = torch.log((total + 1.0) / (df + 1.0))
+            per_target[target.name] = (
+                (base[target.name] ** alpha) * (tf**beta) * (idf**gamma)
+            ).cpu()
+        results[key] = per_target
+    return results
 
 
 def compute_first_order_scores(
@@ -414,6 +473,21 @@ def _ensure_residual_alignment(
         block.downsample = ChannelPad(keep.tolist(), output_channels)
 
 
+def _align_downsample_input(block: nn.Module, keep: torch.Tensor) -> None:
+    """Slice the residual downsample to accept the pruned identity tensor."""
+
+    downsample = getattr(block, "downsample", None)
+    if downsample is None:
+        return
+
+    if isinstance(downsample, nn.Sequential) and len(downsample) > 0:
+        first = downsample[0]
+        if isinstance(first, nn.Conv2d):
+            downsample[0] = _slice_conv_in(first, keep)
+    elif isinstance(downsample, nn.Conv2d):
+        block.downsample = _slice_conv_in(downsample, keep)
+
+
 def apply_structured_pruning(
     bundle: ModelBundle,
     target: ChannelTarget,
@@ -462,6 +536,7 @@ def apply_structured_pruning(
                     keep,
                     getattr(block, "conv2", next_module).out_channels,
                 )
+                _align_downsample_input(block, keep)
 
     if "." in target.conv:
         block_name = target.conv.rsplit(".", 1)[0]
