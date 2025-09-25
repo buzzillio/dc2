@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModelForImageClassification
+from transformers import AutoModelForImageClassification
 
 
 @dataclass
@@ -40,6 +40,20 @@ def _find_classifier(model: nn.Module) -> tuple[str, nn.Linear]:
     raise ValueError("Could not locate a linear classifier in the model")
 
 
+def _set_module(model: nn.Module, module_path: str, new_module: nn.Module) -> None:
+    """Replace a submodule given its dotted path name."""
+
+    parts = module_path.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    last = parts[-1]
+    if last.isdigit():
+        parent[int(last)] = new_module
+    else:
+        setattr(parent, last, new_module)
+
+
 def load_model(
     hf_model_id: str,
     device: torch.device,
@@ -48,21 +62,20 @@ def load_model(
 ) -> ModelBundle:
     """Load a Hugging Face classification model and locate its classifier."""
 
-    config = AutoConfig.from_pretrained(hf_model_id)
-    if num_classes is not None and config.num_labels != num_classes:
-        config.num_labels = num_classes
-    model = AutoModelForImageClassification.from_pretrained(hf_model_id, config=config)
+    model = AutoModelForImageClassification.from_pretrained(hf_model_id)
     model.to(device)
     model.eval()
 
     classifier_name, classifier = _find_classifier(model)
     feature_dim = classifier.in_features
 
-    if classifier.out_features != config.num_labels:
-        raise ValueError(
-            "Classifier output dimension does not match dataset labels: "
-            f"{classifier.out_features} != {config.num_labels}"
-        )
+    target_num_classes = num_classes if num_classes is not None else model.config.num_labels
+    if classifier.out_features != target_num_classes:
+        new_classifier = nn.Linear(feature_dim, target_num_classes)
+        new_classifier.to(classifier.weight.device)
+        _set_module(model, classifier_name, new_classifier)
+        classifier = new_classifier
+        model.config.num_labels = target_num_classes
 
     if use_cuda and torch.cuda.is_available():
         model = model.cuda()
