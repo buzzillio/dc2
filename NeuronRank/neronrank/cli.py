@@ -322,6 +322,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
         for stats_mode, scores in score_tensors.items():
+
             if args.scope == "fc":
                 for sparsity in args.sparsities:
                     print(
