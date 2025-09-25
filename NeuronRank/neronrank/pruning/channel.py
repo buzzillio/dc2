@@ -3,13 +3,50 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 from ..models.resnet_loader import ModelBundle
 from .mask import build_keep_indices, count_parameters
+
+
+class ChannelSelect(nn.Module):
+    """Select a subset of channels from the input tensor."""
+
+    def __init__(self, indices: Sequence[int]):
+        super().__init__()
+        self.register_buffer("indices", torch.tensor(list(indices), dtype=torch.long))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if x.dim() != 4:
+            raise RuntimeError("ChannelSelect expects a 4D tensor input")
+        return x.index_select(1, self.indices)
+
+
+class ChannelPad(nn.Module):
+    """Scatter input channels into a larger tensor, zero-filling missing ones."""
+
+    def __init__(self, indices: Sequence[int], out_channels: int):
+        super().__init__()
+        mapped = list(indices)
+        if len(mapped) > out_channels:
+            raise ValueError("Cannot map more indices than available output channels")
+        self.register_buffer("indices", torch.tensor(mapped, dtype=torch.long))
+        self.out_channels = int(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if x.dim() != 4:
+            raise RuntimeError("ChannelPad expects a 4D tensor input")
+        if x.size(1) != self.indices.numel():
+            raise RuntimeError(
+                "ChannelPad received input with unexpected channel dimension"
+            )
+        batch, _, height, width = x.shape
+        output = x.new_zeros((batch, self.out_channels, height, width))
+        output[:, self.indices, :, :] = x
+        return output
 
 
 @dataclass
@@ -348,6 +385,35 @@ def _slice_linear_in(linear: nn.Linear, keep: torch.Tensor) -> nn.Linear:
     return new_linear
 
 
+def _ensure_residual_alignment(
+    block: nn.Module,
+    keep: torch.Tensor,
+    output_channels: int,
+) -> None:
+    """Ensure a residual block can add tensors with matching channel dimensions."""
+
+    if not hasattr(block, "conv1") or not hasattr(block, "conv2"):
+        return
+    identity_channels = getattr(block.conv1, "in_channels", None)
+    if identity_channels is None:
+        return
+    downsample = getattr(block, "downsample", None)
+    if downsample is not None:
+        # Existing downsample will be updated separately when needed.
+        return
+    if identity_channels == output_channels:
+        return
+
+    if identity_channels > output_channels:
+        if len(keep) != output_channels:
+            raise RuntimeError("Keep indices do not match residual output channels")
+        block.downsample = ChannelSelect(keep.tolist())
+    else:
+        if len(keep) != identity_channels:
+            raise RuntimeError("Cannot expand residual without full keep mapping")
+        block.downsample = ChannelPad(keep.tolist(), output_channels)
+
+
 def apply_structured_pruning(
     bundle: ModelBundle,
     target: ChannelTarget,
@@ -389,6 +455,19 @@ def apply_structured_pruning(
             if isinstance(next_module, nn.Conv2d):
                 pruned_next = _slice_conv_in(next_module, keep)
                 _set_module(new_model, target.next_conv, pruned_next)
+                block_name = target.next_conv.rsplit(".", 1)[0]
+                block = _get_module(new_model, block_name)
+                _ensure_residual_alignment(
+                    block,
+                    keep,
+                    getattr(block, "conv2", next_module).out_channels,
+                )
+
+    if "." in target.conv:
+        block_name = target.conv.rsplit(".", 1)[0]
+        block = _get_module(new_model, block_name)
+        if hasattr(block, "conv2"):
+            _ensure_residual_alignment(block, keep, block.conv2.out_channels)
 
     new_bundle = ModelBundle(
         model=new_model,
