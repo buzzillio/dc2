@@ -92,6 +92,9 @@ def neuronrank_scores(
 
     scores: ScoreDict = {}
 
+    if "post" in activations:
+        weight_abs = linear.weight.detach().abs()
+
     for key, acts in activations.items():
         if key == "post":
             acts = _project_post_activations(acts, weight_abs)
