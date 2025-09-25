@@ -296,7 +296,12 @@ def run(args: argparse.Namespace) -> None:
     channel_targets: List[channel.ChannelTarget] = []
     if args.scope == "all":
         if statistics_modes != ["post"]:
-            raise ValueError("--scope all currently supports only post statistics")
+            print(
+                "[NeuronRank] Warning: --scope all supports only post statistics; "
+                "overriding --statistics to 'post'",
+                flush=True,
+            )
+            statistics_modes = ["post"]
         channel_targets = channel.discover_resnet_targets(
             base_bundle.model, base_bundle.classifier_name
         )
