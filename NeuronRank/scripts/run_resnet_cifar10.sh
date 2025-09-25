@@ -7,7 +7,9 @@ python -m neuronrank.cli \
   --dataset cifar10 \
   --methods NR,MB,FO \
   --statistics before \
+
   --sparsities 0.8,0.9,0.95,0.96,0.97,0.975,0.98,0.985,0.99 \
+
   --calib-size 4096 \
   --batch-size 128 \
   --recover-epochs 1 \
@@ -15,5 +17,7 @@ python -m neuronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
+
 # CLI auto-saves plots; rerun manually for custom filters:
+
 python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"

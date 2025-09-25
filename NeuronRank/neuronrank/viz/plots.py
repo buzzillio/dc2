@@ -45,20 +45,24 @@ def create_plot(
     if df.empty:
         raise ValueError("No rows to plot after filtering")
 
+
     methods = sorted(df["method"].unique())
     plt.figure(figsize=(8, 5))
 
     for method in methods:
+
         method_df = df[df["method"] == method].sort_values("kept_params")
         zero_subset = method_df[method_df["ft_epochs"] == 0]
         color = COLORS.get(method)
         plt.plot(
             zero_subset["kept_params"] / 1_000_000.0,
             zero_subset["zero_shot_acc_top1"],
+
             label=f"{method} (zero-shot)",
             marker="o",
             color=color,
         )
+
         if with_ft:
             ft_subset = method_df[method_df["ft_epochs"] > 0].dropna(
                 subset=["ft_acc_top1"]
@@ -79,6 +83,7 @@ def create_plot(
     if statistics is not None:
         title += f" [{statistics}]"
     plt.title(title)
+
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
