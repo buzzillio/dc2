@@ -15,23 +15,11 @@ ScoreDict = Dict[str, torch.Tensor]
 def magnitude_scores(
     linear: nn.Linear,
     p: float = 1.0,
-
-    mode: StatisticsMode = "post",
 ) -> torch.Tensor:
-    """Compute magnitude-based scores for the requested activation orientation."""
-
-    if mode not in ("before", "post"):
-        raise ValueError("mode must be 'before' or 'post'")
-
+    """Compute magnitude-based scores for a linear layer."""
 
     weight = linear.weight.detach().abs()
-    if mode == "before":
-        reduce_dims = (0,) if weight.dim() == 2 else (0,) + tuple(range(2, weight.dim()))
-    else:  # "post" statistics operate on the module outputs
-        reduce_dims = (1,) if weight.dim() == 2 else tuple(range(1, weight.dim()))
-
     if p == 2.0:
-
         scores = torch.sqrt((weight**2).sum(dim=0))
     else:
         scores = weight.sum(dim=0)
@@ -39,7 +27,10 @@ def magnitude_scores(
 
 
 def _project_post_activations(
-    acts: torch.Tensor, weight_abs: torch.Tensor, eps: float = 1e-12
+    acts: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float = 1e-12,
 ) -> torch.Tensor:
     """Project module outputs onto the classifier input space.
 
@@ -47,16 +38,16 @@ def _project_post_activations(
     logits produced by the layer. To reuse those statistics for input-neuron pruning we
     distribute each output activation back to the inputs proportional to the absolute
     connection strength. The result is a non-negative matrix with the same second
-    dimension as ``weight_abs.shape[1]`` (i.e. the classifier's input width).
+    dimension as ``weight.shape[1]`` (i.e. the classifier's input width).
     """
 
     if acts.dim() != 2:
         acts = acts.flatten(start_dim=1)
 
-    if weight_abs.device != acts.device:
-        weight_abs = weight_abs.to(acts.device)
+    device = acts.device
+    weight_abs = weight.detach().abs().to(device)
 
-    out_features, in_features = weight_abs.shape
+    out_features, _ = weight_abs.shape
     if acts.shape[1] != out_features:
         raise RuntimeError(
             "Post-activation statistics produced {act_dim} features but the classifier "
@@ -64,9 +55,14 @@ def _project_post_activations(
             "classifiers only.".format(act_dim=acts.shape[1], out_dim=out_features)
         )
 
-    column_sums = weight_abs.sum(dim=0, keepdim=True).clamp_min(eps)
-    mixing = weight_abs / column_sums
-    projected = acts.abs().to(weight_abs.dtype) @ mixing
+    if bias is not None:
+        bias = bias.detach().to(device=device, dtype=acts.dtype)
+        acts = acts - bias
+
+    row_sums = weight_abs.sum(dim=1, keepdim=True).clamp_min(eps)
+    mixing = weight_abs / row_sums
+    acts_abs = acts.abs().to(device=device, dtype=weight_abs.dtype)
+    projected = acts_abs @ mixing
     return projected
 
 
@@ -87,20 +83,22 @@ def neuronrank_scores(
 
     activations = collect_activations(model, module, dataloader, device, mode, limit)
 
+    base_magnitude = magnitude_scores(linear)
     weight_mag: Dict[str, torch.Tensor] = {}
     if mode in ("before", "all"):
-        weight_mag["before"] = magnitude_scores(linear, mode="before")
+        weight_mag["before"] = base_magnitude
     if mode in ("post", "all"):
-        weight_mag["post"] = magnitude_scores(linear, mode="post")
+        weight_mag["post"] = base_magnitude
 
     scores: ScoreDict = {}
 
     if "post" in activations:
-        weight_abs = linear.weight.detach().abs()
+        weight = linear.weight.detach()
+        bias = linear.bias.detach() if linear.bias is not None else None
 
     for key, acts in activations.items():
         if key == "post":
-            acts = _project_post_activations(acts, weight_abs)
+            acts = _project_post_activations(acts, weight, bias)
         else:
             acts = acts.abs()
 
