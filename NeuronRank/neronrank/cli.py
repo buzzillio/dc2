@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -181,13 +182,37 @@ def run(args: argparse.Namespace) -> None:
     seed = resolve_seed(args.seed)
     set_seed(seed)
 
-    loaders = get_dataset(
-        args.dataset,
-        args.batch_size,
-        args.calib_size,
-        args.num_workers,
-        seed,
-        imagenet_val=args.imagenet_val,
+    print(
+        f"[NeuronRank] Using device: {device} | seed={seed} | dataset={args.dataset}",
+        flush=True,
+    )
+    print("[NeuronRank] Preparing data loaders…", flush=True)
+    try:
+        loaders = get_dataset(
+            args.dataset,
+            args.batch_size,
+            args.calib_size,
+            args.num_workers,
+            seed,
+            imagenet_val=args.imagenet_val,
+        )
+    except FileNotFoundError as exc:
+        print(f"[NeuronRank] Dataset error: {exc}", file=sys.stderr, flush=True)
+        raise
+
+    def _safe_len(loader):
+        try:
+            return len(loader.dataset)
+        except Exception:  # pragma: no cover - defensive
+            return "?"
+
+    print(
+        "[NeuronRank] Data ready | train={} | calib={} | eval={}".format(
+            _safe_len(loaders.train),
+            _safe_len(loaders.calibration),
+            _safe_len(loaders.eval),
+        ),
+        flush=True,
     )
 
     base_bundle = load_model(
@@ -204,6 +229,7 @@ def run(args: argparse.Namespace) -> None:
     statistics_modes = compute_statistics_modes(args.statistics)
 
     for method in args.methods:
+        print(f"[NeuronRank] Computing scores with method={method}…", flush=True)
         score_time_start = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -215,6 +241,10 @@ def run(args: argparse.Namespace) -> None:
 
         for stats_mode, scores in score_tensors.items():
             for sparsity in args.sparsities:
+                print(
+                    f"[NeuronRank] Evaluating sparsity={sparsity:.2f} ({stats_mode})",
+                    flush=True,
+                )
                 keep_indices = mask.build_keep_indices(scores, sparsity)
                 pruned_bundle = mask.apply_pruning(base_bundle, keep_indices)
                 pruned_bundle.model.to(device)
@@ -257,6 +287,10 @@ def run(args: argparse.Namespace) -> None:
                     notes=args.notes,
                 )
                 logger.log(row)
+                print(
+                    f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
+                    flush=True,
+                )
 
 
 def main() -> None:
