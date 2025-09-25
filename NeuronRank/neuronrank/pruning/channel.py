@@ -65,12 +65,14 @@ class ChannelTarget:
     out_channels: int
 
 
+
 @dataclass(frozen=True)
 class ChannelFootprint:
     """Accounting helper describing parameters controlled by a target."""
 
     per_channel_params: int
     total_params: int
+
 
 
 def _get_module(root: nn.Module, name: str) -> nn.Module:
@@ -226,6 +228,7 @@ def compute_target_footprint(model: nn.Module, target: ChannelTarget) -> Channel
 
     total = per_channel * target.out_channels
     return ChannelFootprint(per_channel_params=int(per_channel), total_params=int(total))
+
 
 
 def _prepare_storage(targets: Iterable[ChannelTarget]) -> Dict[str, Dict[str, torch.Tensor]]:
