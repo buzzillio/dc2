@@ -18,7 +18,9 @@ try:  # pragma: no cover - import shim for direct script execution
     from .models import ModelBundle, load_model
     from .pruning import mask, scoring
 
+
     from .pruning.hooks import StatisticsMode
+
 
     from .utils.logging import CSVLogger, MetricRow
     from .utils.seed import resolve_seed, set_seed
@@ -33,7 +35,9 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         from neronrank.models import ModelBundle, load_model
         from neronrank.pruning import mask, scoring
 
+
         from neronrank.pruning.hooks import StatisticsMode
+
 
 
         from neronrank.utils.logging import CSVLogger, MetricRow
@@ -74,9 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def determine_device(request_cuda: bool) -> torch.device:
-    if request_cuda and torch.cuda.is_available():
+    if request_cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--cuda requested but no CUDA devices are available")
         return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() and request_cuda else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def prepare_output_dir(path: Path) -> None:
