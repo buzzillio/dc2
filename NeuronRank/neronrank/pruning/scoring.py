@@ -15,18 +15,23 @@ ScoreDict = Dict[str, torch.Tensor]
 def magnitude_scores(
     linear: nn.Linear,
     p: float = 1.0,
-    mode: StatisticsMode | None = None,
-) -> torch.Tensor:
-    """Compute magnitude-based scores (L1 by default).
 
-    The optional ``mode`` argument is accepted for backward compatibility with callers
-    that differentiate between activation orientations, but the returned scores always
-    correspond to the neuron's input features so they can be combined with pruning
-    masks regardless of the chosen statistics mode.
-    """
+    mode: StatisticsMode = "post",
+) -> torch.Tensor:
+    """Compute magnitude-based scores for the requested activation orientation."""
+
+    if mode not in ("before", "post"):
+        raise ValueError("mode must be 'before' or 'post'")
+
 
     weight = linear.weight.detach().abs()
+    if mode == "before":
+        reduce_dims = (0,) if weight.dim() == 2 else (0,) + tuple(range(2, weight.dim()))
+    else:  # "post" statistics operate on the module outputs
+        reduce_dims = (1,) if weight.dim() == 2 else tuple(range(1, weight.dim()))
+
     if p == 2.0:
+
         scores = torch.sqrt((weight**2).sum(dim=0))
     else:
         scores = weight.sum(dim=0)
@@ -62,6 +67,7 @@ def _project_post_activations(
     return projected
 
 
+
 def neuronrank_scores(
     model: nn.Module,
     linear: nn.Linear,
@@ -77,8 +83,13 @@ def neuronrank_scores(
     """Compute NeuronRank (TF-IDF × magnitude) scores."""
 
     activations = collect_activations(model, module, dataloader, device, mode, limit)
-    weight_abs = linear.weight.detach().abs().cpu()
-    base_magnitude = magnitude_scores(linear, mode="before")
+
+    weight_mag: Dict[str, torch.Tensor] = {}
+    if mode in ("before", "all"):
+        weight_mag["before"] = magnitude_scores(linear, mode="before")
+    if mode in ("post", "all"):
+        weight_mag["post"] = magnitude_scores(linear, mode="post")
+
     scores: ScoreDict = {}
 
     for key, acts in activations.items():
@@ -91,7 +102,10 @@ def neuronrank_scores(
         tf = acts.mean(dim=0)
         df = (acts > 1e-6).float().sum(dim=0)
         idf = torch.log((total + 1.0) / (df + 1.0))
-        scores[key] = ((base_magnitude**alpha) * (tf**beta) * (idf**gamma)).cpu()
+
+        base = weight_mag[key]
+        scores[key] = ((base**alpha) * (tf**beta) * (idf**gamma)).cpu()
+
     return scores
 
 
