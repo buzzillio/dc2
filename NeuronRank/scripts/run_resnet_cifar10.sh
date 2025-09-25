@@ -2,7 +2,7 @@
 set -euo pipefail
 
 OUT="runs/resnet18-cifar10"
-python -m neronrank.cli \
+python -m neuronrank.cli \
   --hf-model-id edadaltocg/resnet18_cifar10 \
   --dataset cifar10 \
   --methods NR,MB,FO \
@@ -15,4 +15,4 @@ python -m neronrank.cli \
   --output-dir "${OUT}" \
   --cuda
 
-python -m neronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
+python -m neuronrank.viz.plots --csv "${OUT}/metrics.csv" --out "${OUT}/acc_vs_params.png"
