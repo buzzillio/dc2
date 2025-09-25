@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, cast
+from typing import Dict, List, Sequence, cast
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ try:  # pragma: no cover - import shim for direct script execution
     from .data import DatasetBundle, get_dataset
     from .eval.metrics import evaluate_topk
     from .models import ModelBundle, load_model
-    from .pruning import mask, scoring
+    from .pruning import channel, mask, scoring
 
 
     from .pruning.hooks import StatisticsMode
@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         from neronrank.data import DatasetBundle, get_dataset
         from neronrank.eval.metrics import evaluate_topk
         from neronrank.models import ModelBundle, load_model
-        from neronrank.pruning import mask, scoring
+        from neronrank.pruning import channel, mask, scoring
 
 
         from neronrank.pruning.hooks import StatisticsMode
@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imagenet-val", type=str, default=None)
     parser.add_argument("--methods", type=parse_methods, default=parse_methods("NR,MB,FO"))
     parser.add_argument("--statistics", type=str, default="before")
+    parser.add_argument("--scope", type=str, choices=("fc", "all"), default="fc")
     parser.add_argument(
         "--sparsities",
         type=parse_sparsities,
@@ -160,7 +161,7 @@ def finetune(
     return ft_accuracy, total_time, avg_time
 
 
-def compute_scores(
+def compute_classifier_scores(
     method: str,
     statistics_mode: List[str],
     base_bundle: ModelBundle,
@@ -206,6 +207,39 @@ def compute_scores(
     else:
         raise ValueError(f"Unknown method: {method}")
     return scores
+
+
+def compute_channel_scores(
+    method: str,
+    base_bundle: ModelBundle,
+    targets: Sequence[channel.ChannelTarget],
+    loaders: DatasetBundle,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> Dict[str, torch.Tensor]:
+    method = method.upper()
+    if method == "MB":
+        return channel.compute_magnitude_scores(base_bundle.model, targets)
+    if method == "NR":
+        return channel.compute_neuronrank_scores(
+            base_bundle.model,
+            targets,
+            loaders.calibration,
+            device,
+            alpha=args.tfidf_alpha,
+            beta=args.tfidf_beta,
+            gamma=args.tfidf_gamma,
+            limit=args.calib_size,
+        )
+    if method == "FO":
+        return channel.compute_first_order_scores(
+            base_bundle.model,
+            targets,
+            loaders.calibration,
+            device,
+            limit=args.calib_size,
+        )
+    raise ValueError(f"Unknown method: {method}")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -259,70 +293,165 @@ def run(args: argparse.Namespace) -> None:
     metrics_path = args.output_dir / "metrics.csv"
     logger = CSVLogger(str(metrics_path))
     statistics_modes = compute_statistics_modes(args.statistics)
+    channel_targets: List[channel.ChannelTarget] = []
+    if args.scope == "all":
+        if statistics_modes != ["post"]:
+            raise ValueError("--scope all currently supports only post statistics")
+        channel_targets = channel.discover_resnet_targets(
+            base_bundle.model, base_bundle.classifier_name
+        )
 
     for method in args.methods:
         print(f"[NeuronRank] Computing scores with method={method}…", flush=True)
         score_time_start = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        score_tensors = compute_scores(method, statistics_modes, base_bundle, loaders, device, args)
+        if args.scope == "fc":
+            score_tensors = compute_classifier_scores(
+                method, statistics_modes, base_bundle, loaders, device, args
+            )
+        else:
+            score_tensors = {
+                "post": compute_channel_scores(
+                    method, base_bundle, channel_targets, loaders, device, args
+                )
+            }
         score_time = time.time() - score_time_start
         peak_mem = (
             torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else 0.0
         )
 
         for stats_mode, scores in score_tensors.items():
-            for sparsity in args.sparsities:
-                print(
-                    f"[NeuronRank] Evaluating sparsity={sparsity:.2f} ({stats_mode})",
-                    flush=True,
-                )
-                keep_indices = mask.build_keep_indices(scores, sparsity)
-                pruned_bundle = mask.apply_pruning(base_bundle, keep_indices)
-                pruned_bundle.model.to(device)
+            if args.scope == "fc":
+                for sparsity in args.sparsities:
+                    print(
+                        f"[NeuronRank] Evaluating sparsity={sparsity:.2f} ({stats_mode})",
+                        flush=True,
+                    )
+                    keep_indices = mask.build_keep_indices(scores, sparsity)
+                    pruned_bundle = mask.apply_pruning(base_bundle, keep_indices)
+                    pruned_bundle.model.to(device)
 
-                kept_params = mask.count_parameters(pruned_bundle.model)
-                zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
+                    kept_params = mask.count_parameters(pruned_bundle.model)
+                    zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
 
-                ft_acc, ft_total_time, ft_epoch_avg = finetune(
-                    pruned_bundle,
-                    loaders,
-                    device,
-                    args.recover_epochs,
-                    args.lr,
-                    args.weight_decay,
-                    args.momentum,
-                    args.amp,
-                    args.log_interval,
-                )
+                    timestamp = datetime.utcnow().isoformat()
+                    row_data = dict(
+                        timestamp=timestamp,
+                        seed=seed,
+                        device=str(device),
+                        dataset=args.dataset,
+                        hf_model_id=args.hf_model_id,
+                        layer=base_bundle.classifier_name,
+                        method=method,
+                        statistics=stats_mode,
+                        sparsity=sparsity,
+                        kept_params=kept_params,
+                        zero_shot_acc_top1=zero_acc,
+                        zero_shot_eval_time_s=eval_time,
+                        score_time_s=score_time,
+                        score_peak_mem_mb=peak_mem,
+                        ft_epochs=0,
+                        ft_epoch_time_avg_s=0.0,
+                        ft_total_time_s=0.0,
+                        ft_acc_top1=float("nan"),
+                        notes=args.notes,
+                    )
+                    logger.log(MetricRow(**row_data))
 
-                timestamp = datetime.utcnow().isoformat()
-                row = MetricRow(
-                    timestamp=timestamp,
-                    seed=seed,
-                    device=str(device),
-                    dataset=args.dataset,
-                    hf_model_id=args.hf_model_id,
-                    layer=base_bundle.classifier_name,
-                    method=method,
-                    statistics=stats_mode,
-                    sparsity=sparsity,
-                    kept_params=kept_params,
-                    zero_shot_acc_top1=zero_acc,
-                    zero_shot_eval_time_s=eval_time,
-                    score_time_s=score_time,
-                    score_peak_mem_mb=peak_mem,
-                    ft_epochs=args.recover_epochs,
-                    ft_epoch_time_avg_s=ft_epoch_avg,
-                    ft_total_time_s=ft_total_time,
-                    ft_acc_top1=ft_acc,
-                    notes=args.notes,
-                )
-                logger.log(row)
-                print(
-                    f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
-                    flush=True,
-                )
+                    if args.recover_epochs > 0:
+                        ft_acc, ft_total_time, ft_epoch_avg = finetune(
+                            pruned_bundle,
+                            loaders,
+                            device,
+                            args.recover_epochs,
+                            args.lr,
+                            args.weight_decay,
+                            args.momentum,
+                            args.amp,
+                            args.log_interval,
+                        )
+                        row_data.update(
+                            ft_epochs=args.recover_epochs,
+                            ft_acc_top1=ft_acc,
+                            ft_total_time_s=ft_total_time,
+                            ft_epoch_time_avg_s=ft_epoch_avg,
+                        )
+                        logger.log(MetricRow(**row_data))
+                    print(
+                        f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
+                        flush=True,
+                    )
+            else:
+                for target in channel_targets:
+                    layer_scores = scores[target.name]
+                    for sparsity in args.sparsities:
+                        effective = min(sparsity, target.max_sparsity)
+                        print(
+                            "[NeuronRank] Evaluating layer={} sparsity={:.2f} ({})".format(
+                                target.name, effective, method
+                            ),
+                            flush=True,
+                        )
+                        keep_indices = channel.plan_layer_keep_indices(
+                            layer_scores, sparsity, target.max_sparsity
+                        )
+                        pruned_bundle, kept_params = channel.apply_structured_pruning(
+                            base_bundle, target, keep_indices
+                        )
+                        pruned_bundle.model.to(device)
+
+                        zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
+
+                        timestamp = datetime.utcnow().isoformat()
+                        row_data = dict(
+                            timestamp=timestamp,
+                            seed=seed,
+                            device=str(device),
+                            dataset=args.dataset,
+                            hf_model_id=args.hf_model_id,
+                            layer=target.name,
+                            method=method,
+                            statistics=stats_mode,
+                            sparsity=effective,
+                            kept_params=kept_params,
+                            zero_shot_acc_top1=zero_acc,
+                            zero_shot_eval_time_s=eval_time,
+                            score_time_s=score_time,
+                            score_peak_mem_mb=peak_mem,
+                            ft_epochs=0,
+                            ft_epoch_time_avg_s=0.0,
+                            ft_total_time_s=0.0,
+                            ft_acc_top1=float("nan"),
+                            notes=args.notes,
+                        )
+                        logger.log(MetricRow(**row_data))
+
+                        if args.recover_epochs > 0:
+                            ft_acc, ft_total_time, ft_epoch_avg = finetune(
+                                pruned_bundle,
+                                loaders,
+                                device,
+                                args.recover_epochs,
+                                args.lr,
+                                args.weight_decay,
+                                args.momentum,
+                                args.amp,
+                                args.log_interval,
+                            )
+                            row_data.update(
+                                ft_epochs=args.recover_epochs,
+                                ft_acc_top1=ft_acc,
+                                ft_total_time_s=ft_total_time,
+                                ft_epoch_time_avg_s=ft_epoch_avg,
+                            )
+                            logger.log(MetricRow(**row_data))
+                        print(
+                            "[NeuronRank] Logged results | method={} | layer={} | sparsity={:.2f}".format(
+                                method, target.name, effective
+                            ),
+                            flush=True,
+                        )
 
 
 def main() -> None:
