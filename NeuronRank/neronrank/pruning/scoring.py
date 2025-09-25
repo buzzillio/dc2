@@ -12,13 +12,27 @@ from .hooks import StatisticsMode, collect_activations
 ScoreDict = Dict[str, torch.Tensor]
 
 
-def magnitude_scores(linear: nn.Linear, p: float = 1.0) -> torch.Tensor:
-    """Compute magnitude-based scores (L1 by default)."""
+def magnitude_scores(
+    linear: nn.Linear,
+    p: float = 1.0,
+    mode: StatisticsMode = "post",
+) -> torch.Tensor:
+    """Compute magnitude-based scores for the requested activation orientation."""
+
+    if mode not in ("before", "post"):
+        raise ValueError("mode must be 'before' or 'post'")
 
     weight = linear.weight.detach().abs()
+    if mode == "before":
+        reduce_dims = (0,) if weight.dim() == 2 else (0,) + tuple(range(2, weight.dim()))
+    else:  # "post" statistics operate on the module outputs
+        reduce_dims = (1,) if weight.dim() == 2 else tuple(range(1, weight.dim()))
+
     if p == 2.0:
-        return torch.sqrt((weight**2).sum(dim=0)).cpu()
-    return weight.sum(dim=0).cpu()
+        scores = torch.sqrt((weight**2).sum(dim=reduce_dims))
+    else:
+        scores = weight.sum(dim=reduce_dims)
+    return scores.cpu()
 
 
 def neuronrank_scores(
@@ -36,7 +50,11 @@ def neuronrank_scores(
     """Compute NeuronRank (TF-IDF × magnitude) scores."""
 
     activations = collect_activations(model, module, dataloader, device, mode, limit)
-    weight_mag = magnitude_scores(linear).cpu()
+    weight_mag: Dict[str, torch.Tensor] = {}
+    if mode in ("before", "all"):
+        weight_mag["before"] = magnitude_scores(linear, mode="before")
+    if mode in ("post", "all"):
+        weight_mag["post"] = magnitude_scores(linear, mode="post")
     scores: ScoreDict = {}
 
     for key, acts in activations.items():
@@ -44,7 +62,8 @@ def neuronrank_scores(
         tf = acts.abs().mean(dim=0)
         df = (acts.abs() > 1e-6).float().sum(dim=0)
         idf = torch.log((total + 1.0) / (df + 1.0))
-        scores[key] = ((weight_mag**alpha) * (tf**beta) * (idf**gamma)).cpu()
+        base = weight_mag[key]
+        scores[key] = ((base**alpha) * (tf**beta) * (idf**gamma)).cpu()
     return scores
 
 

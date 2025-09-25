@@ -2,21 +2,39 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, cast
 
 import torch
 import torch.nn as nn
 
-from .config import ExperimentConfig, parse_methods, parse_sparsities
-from .data import DatasetBundle, get_dataset
-from .eval.metrics import evaluate_topk
-from .models import ModelBundle, load_model
-from .pruning import mask, scoring
-from .utils.logging import CSVLogger, MetricRow
-from .utils.seed import resolve_seed, set_seed
+try:  # pragma: no cover - import shim for direct script execution
+    from .config import ExperimentConfig, parse_methods, parse_sparsities
+    from .data import DatasetBundle, get_dataset
+    from .eval.metrics import evaluate_topk
+    from .models import ModelBundle, load_model
+    from .pruning import mask, scoring
+    from .pruning.hooks import StatisticsMode
+    from .utils.logging import CSVLogger, MetricRow
+    from .utils.seed import resolve_seed, set_seed
+except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
+    if __package__ in (None, ""):
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from neronrank.config import ExperimentConfig, parse_methods, parse_sparsities
+        from neronrank.data import DatasetBundle, get_dataset
+        from neronrank.eval.metrics import evaluate_topk
+        from neronrank.models import ModelBundle, load_model
+        from neronrank.pruning import mask, scoring
+        from neronrank.pruning.hooks import StatisticsMode
+        from neronrank.utils.logging import CSVLogger, MetricRow
+        from neronrank.utils.seed import resolve_seed, set_seed
+    else:  # re-raise unexpected import errors inside the package
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,18 +161,22 @@ def compute_scores(
     scores: Dict[str, torch.Tensor] = {}
 
     if method == "MB":
-        base = scoring.magnitude_scores(base_bundle.classifier)
         for mode in statistics_mode:
-            scores[mode] = base
+            stats_mode = cast(StatisticsMode, mode)
+            scores[mode] = scoring.magnitude_scores(
+                base_bundle.classifier,
+                mode=stats_mode,
+            )
     elif method == "NR":
-        stats_mode = "all" if len(statistics_mode) > 1 else statistics_mode[0]
+        raw_mode = "all" if len(statistics_mode) > 1 else statistics_mode[0]
+        stats_mode = cast(StatisticsMode, raw_mode)
         scores = scoring.neuronrank_scores(
             base_bundle.model,
             base_bundle.classifier,
             base_bundle.classifier,
             loaders.calibration,
             device,
-            stats_mode,  # type: ignore[arg-type]
+            stats_mode,
             alpha=args.tfidf_alpha,
             beta=args.tfidf_beta,
             gamma=args.tfidf_gamma,
@@ -181,13 +203,37 @@ def run(args: argparse.Namespace) -> None:
     seed = resolve_seed(args.seed)
     set_seed(seed)
 
-    loaders = get_dataset(
-        args.dataset,
-        args.batch_size,
-        args.calib_size,
-        args.num_workers,
-        seed,
-        imagenet_val=args.imagenet_val,
+    print(
+        f"[NeuronRank] Using device: {device} | seed={seed} | dataset={args.dataset}",
+        flush=True,
+    )
+    print("[NeuronRank] Preparing data loaders…", flush=True)
+    try:
+        loaders = get_dataset(
+            args.dataset,
+            args.batch_size,
+            args.calib_size,
+            args.num_workers,
+            seed,
+            imagenet_val=args.imagenet_val,
+        )
+    except FileNotFoundError as exc:
+        print(f"[NeuronRank] Dataset error: {exc}", file=sys.stderr, flush=True)
+        raise
+
+    def _safe_len(loader):
+        try:
+            return len(loader.dataset)
+        except Exception:  # pragma: no cover - defensive
+            return "?"
+
+    print(
+        "[NeuronRank] Data ready | train={} | calib={} | eval={}".format(
+            _safe_len(loaders.train),
+            _safe_len(loaders.calibration),
+            _safe_len(loaders.eval),
+        ),
+        flush=True,
     )
 
     base_bundle = load_model(
@@ -204,6 +250,7 @@ def run(args: argparse.Namespace) -> None:
     statistics_modes = compute_statistics_modes(args.statistics)
 
     for method in args.methods:
+        print(f"[NeuronRank] Computing scores with method={method}…", flush=True)
         score_time_start = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -215,6 +262,10 @@ def run(args: argparse.Namespace) -> None:
 
         for stats_mode, scores in score_tensors.items():
             for sparsity in args.sparsities:
+                print(
+                    f"[NeuronRank] Evaluating sparsity={sparsity:.2f} ({stats_mode})",
+                    flush=True,
+                )
                 keep_indices = mask.build_keep_indices(scores, sparsity)
                 pruned_bundle = mask.apply_pruning(base_bundle, keep_indices)
                 pruned_bundle.model.to(device)
@@ -257,6 +308,10 @@ def run(args: argparse.Namespace) -> None:
                     notes=args.notes,
                 )
                 logger.log(row)
+                print(
+                    f"[NeuronRank] Logged results | method={method} | stats={stats_mode} | sparsity={sparsity:.2f}",
+                    flush=True,
+                )
 
 
 def main() -> None:

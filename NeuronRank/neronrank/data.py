@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from datasets import load_dataset
@@ -155,7 +156,18 @@ def get_dataset(
     if dataset == "imagenet":
         if not imagenet_val:
             raise ValueError("--imagenet-val must be provided for ImageNet")
+
+        val_path = Path(imagenet_val).expanduser()
+        if not val_path.exists():
+            raise FileNotFoundError(
+                f"ImageNet validation directory not found: {val_path}"
+            )
+        if not any(val_path.iterdir()):
+            raise FileNotFoundError(
+                f"ImageNet validation directory is empty: {val_path}"
+            )
+
         return build_imagenet_loaders(
-            imagenet_val, batch_size, calib_size, num_workers, seed
+            str(val_path), batch_size, calib_size, num_workers, seed
         )
     raise ValueError(f"Unsupported dataset: {dataset}")
