@@ -17,7 +17,9 @@ try:  # pragma: no cover - import shim for direct script execution
     from .eval.metrics import evaluate_topk
     from .models import ModelBundle, load_model
     from .pruning import mask, scoring
+
     from .pruning.hooks import StatisticsMode
+
     from .utils.logging import CSVLogger, MetricRow
     from .utils.seed import resolve_seed, set_seed
 except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
@@ -30,7 +32,10 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
         from neronrank.eval.metrics import evaluate_topk
         from neronrank.models import ModelBundle, load_model
         from neronrank.pruning import mask, scoring
+
         from neronrank.pruning.hooks import StatisticsMode
+
+
         from neronrank.utils.logging import CSVLogger, MetricRow
         from neronrank.utils.seed import resolve_seed, set_seed
     else:  # re-raise unexpected import errors inside the package
