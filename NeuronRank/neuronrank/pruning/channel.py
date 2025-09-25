@@ -66,7 +66,6 @@ class ChannelTarget:
 
 
 
-@dataclass(frozen=True)
 class ChannelFootprint:
     """Accounting helper describing parameters controlled by a target."""
 

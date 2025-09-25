@@ -33,7 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-
 def create_plot(
     csv_path: Path,
     out_path: Path,
@@ -89,7 +88,6 @@ def create_plot(
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
     plt.close()
@@ -100,7 +98,6 @@ def main(args: argparse.Namespace) -> None:
         create_plot(args.csv, args.out, args.statistics, args.with_ft)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-
 
 
 if __name__ == "__main__":

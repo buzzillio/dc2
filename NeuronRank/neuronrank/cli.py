@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - fallback when run as `python cli.py`
 
 
 
+
 def _default_output_dir() -> Path:
     package_root = Path(__file__).resolve().parent.parent
     return (package_root / ExperimentConfig.output_dir).resolve()
@@ -116,7 +117,6 @@ def _classifier_footprint(linear: nn.Linear) -> Tuple[int, int]:
     per_feature = int(linear.out_features)
     total = per_feature * int(linear.in_features)
     return per_feature, total
-
 
 
 def compute_statistics_modes(statistics: str) -> List[str]:
@@ -358,6 +358,8 @@ def run(args: argparse.Namespace) -> None:
             for target in channel_targets
         }
 
+    total_target_params = sum(fp.total_params for fp in target_footprints.values())
+
 
     for method in args.methods:
         print(f"[NeuronRank] Computing scores with method={method}…", flush=True)
@@ -457,102 +459,95 @@ def run(args: argparse.Namespace) -> None:
                         )
 
             else:
-                for target in channel_targets:
-                    layer_scores = scores[target.name]
-                    seen_effective: set[float] = set()
-                    for sparsity in args.sparsities:
-                        effective = min(sparsity, target.max_sparsity)
-                        key = round(effective, 4)
-                        if key in seen_effective:
-                            continue
-                        seen_effective.add(key)
-                        print(
-                            "[NeuronRank] Evaluating layer={} sparsity={:.2f} ({}|{})".format(
-                                target.name, effective, method, stats_mode
-                            ),
-                            flush=True,
-                        )
+                for sparsity in args.sparsities:
+                    working_bundle = base_bundle
+                    total_kept = 0
+                    for target in channel_targets:
+                        layer_scores = scores[target.name]
                         keep_indices = channel.plan_layer_keep_indices(
                             layer_scores, sparsity, target.max_sparsity
                         )
-
-                        pruned_bundle, _ = channel.apply_structured_pruning(
-
-                            base_bundle, target, keep_indices
+                        working_bundle, _ = channel.apply_structured_pruning(
+                            working_bundle, target, keep_indices
                         )
-                        pruned_bundle.model.to(device)
-
-
                         footprint = target_footprints[target.name]
                         kept_channels = len(keep_indices)
-                        kept_block_params = footprint.per_channel_params * kept_channels
-                        compression = (
-                            float(kept_block_params) / float(footprint.total_params)
-                            if footprint.total_params > 0
-                            else 1.0
+                        total_kept += footprint.per_channel_params * kept_channels
+
+                    working_bundle.model.to(device)
+                    compression = (
+                        float(total_kept) / float(total_target_params)
+                        if total_target_params > 0
+                        else 1.0
+                    )
+                    effective = 1.0 - compression
+                    print(
+                        "[NeuronRank] Evaluating global sparsity={:.2f} ({}|{}) -> effective={:.2f}".format(
+                            sparsity, method, stats_mode, effective
+                        ),
+                        flush=True,
+                    )
+
+                    zero_acc, eval_time = evaluate_model(working_bundle, loaders.eval, device)
+
+                    timestamp = datetime.utcnow().isoformat()
+                    row_data = dict(
+                        timestamp=timestamp,
+                        seed=seed,
+                        device=str(device),
+                        dataset=args.dataset,
+                        hf_model_id=args.hf_model_id,
+                        layer="all",
+                        method=method,
+                        statistics=stats_mode,
+                        sparsity=sparsity,
+                        kept_params=int(total_kept),
+                        zero_shot_acc_top1=zero_acc,
+                        zero_shot_eval_time_s=eval_time,
+                        score_time_s=score_time,
+                        score_peak_mem_mb=peak_mem,
+                        ft_epochs=0,
+                        ft_epoch_time_avg_s=0.0,
+                        ft_total_time_s=0.0,
+                        ft_acc_top1=float("nan"),
+                        compression_rate=compression,
+                        notes=args.notes,
+                    )
+                    logger.log(MetricRow(**row_data))
+
+                    if args.recover_epochs > 0:
+                        ft_acc, ft_total_time, ft_epoch_avg = finetune(
+                            working_bundle,
+                            loaders,
+                            device,
+                            args.recover_epochs,
+                            args.lr,
+                            args.weight_decay,
+                            args.momentum,
+                            args.amp,
+                            args.log_interval,
                         )
-
-
-                        zero_acc, eval_time = evaluate_model(pruned_bundle, loaders.eval, device)
-
-                        timestamp = datetime.utcnow().isoformat()
-                        row_data = dict(
-                            timestamp=timestamp,
-                            seed=seed,
-                            device=str(device),
-                            dataset=args.dataset,
-                            hf_model_id=args.hf_model_id,
-                            layer=target.name,
-                            method=method,
-                            statistics=stats_mode,
-                            sparsity=effective,
-
-                            kept_params=kept_block_params,
-
-                            zero_shot_acc_top1=zero_acc,
-                            zero_shot_eval_time_s=eval_time,
-                            score_time_s=score_time,
-                            score_peak_mem_mb=peak_mem,
-                            ft_epochs=0,
-                            ft_epoch_time_avg_s=0.0,
-                            ft_total_time_s=0.0,
-                            ft_acc_top1=float("nan"),
-                            compression_rate=compression,
-
-                            notes=args.notes,
+                        row_data.update(
+                            ft_epochs=args.recover_epochs,
+                            ft_acc_top1=ft_acc,
+                            ft_total_time_s=ft_total_time,
+                            ft_epoch_time_avg_s=ft_epoch_avg,
                         )
                         logger.log(MetricRow(**row_data))
-
-                        if args.recover_epochs > 0:
-                            ft_acc, ft_total_time, ft_epoch_avg = finetune(
-                                pruned_bundle,
-                                loaders,
-                                device,
-                                args.recover_epochs,
-                                args.lr,
-                                args.weight_decay,
-                                args.momentum,
-                                args.amp,
-                                args.log_interval,
-                            )
-                            row_data.update(
-                                ft_epochs=args.recover_epochs,
-                                ft_acc_top1=ft_acc,
-                                ft_total_time_s=ft_total_time,
-                                ft_epoch_time_avg_s=ft_epoch_avg,
-                            )
-                            logger.log(MetricRow(**row_data))
-                        print(
-                            "[NeuronRank] Logged results | method={} | stats={} | layer={} | sparsity={:.2f}".format(
-                                method, stats_mode, target.name, effective
-                            ),
-                            flush=True,
-                        )
-
+                    print(
+                        "[NeuronRank] Logged results | method={} | stats={} | sparsity={:.2f}".format(
+                            method, stats_mode, sparsity
+                        ),
+                        flush=True,
+                    )
 
 
     try:
-        from .viz.plots import create_plot
+        if __package__ in (None, ""):
+            from neuronrank.viz.plots import create_plot
+        else:
+            from .viz.plots import create_plot
+
 
         with_ft = args.recover_epochs > 0
         print("[NeuronRank] Generating plots…", flush=True)

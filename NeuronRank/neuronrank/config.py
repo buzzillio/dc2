@@ -49,6 +49,9 @@ def parse_sparsities(raw: str) -> List[float]:
     """Parse a comma separated sparsity list."""
 
     sparsities: List[float] = []
+
+    seen: set[float] = set()
+
     for item in raw.split(","):
         item = item.strip()
         if not item:
@@ -56,6 +59,11 @@ def parse_sparsities(raw: str) -> List[float]:
         value = float(item)
         if not 0.0 <= value < 1.0:
             raise ValueError(f"Invalid sparsity value: {value}")
+
+        if value in seen:
+            continue
+        seen.add(value)
+
         sparsities.append(value)
     if not sparsities:
         raise ValueError("At least one sparsity must be provided")
