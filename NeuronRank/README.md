@@ -142,6 +142,14 @@ python -m neuronrank.cli \
   --cuda
 ```
 
+### Scope options (`--scope`)
+
+- `fc` *(default)* — prune only the classifier input features (per-neuron pruning of the final linear layer).
+- `cl` — **layer-level** pruning. Aggregates NR/MB/FO scores per residual block,
+  plans which blocks to disable, and rewrites the model to preserve residual
+  alignment while dropping entire blocks.
+- `all` — structured channel pruning across all residual blocks with per-layer sparsity caps.
+
 **Switch to post‑activation statistics:**
 ```bash
 --statistics post
@@ -240,7 +248,7 @@ Row per (method × statistics × sparsity):
 | device | cuda:0 or cpu |
 | dataset | cifar10 or imagenet |
 | hf_model_id | string |
-| layer | “fc” |
+| layer | scope identifier (e.g., “fc”, “layers”, “all”) |
 | method | MB / NR / FO |
 | statistics | before / post |
 | sparsity | float (e.g., 0.7) |
