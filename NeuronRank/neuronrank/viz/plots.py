@@ -46,34 +46,36 @@ def create_plot(
         raise ValueError("No rows to plot after filtering")
 
 
+    compression = df["compression_rate"].replace({0.0: pd.NA})
+    total_params = df["kept_params"] / compression
+    df["total_params"] = total_params.fillna(df["kept_params"])
+    df["pruned_params"] = (df["total_params"] - df["kept_params"]).clip(lower=0)
+    denom = df["total_params"].where(df["total_params"] > 0, pd.NA)
+    df["pruned_percent"] = (df["pruned_params"] / denom) * 100.0
+    df["pruned_percent"] = df["pruned_percent"].fillna(0.0)
+
+    zero_mask = df["ft_epochs"] == 0
+    percent_keys = (
+        df.loc[zero_mask, "pruned_percent"].dropna().round(5).sort_values().unique().tolist()
+    )
+    if not percent_keys:
+        raise ValueError("No zero-shot rows available for plotting")
+    position_map = {pct: idx for idx, pct in enumerate(percent_keys)}
+
     methods = sorted(df["method"].unique())
     fig, ax = plt.subplots(figsize=(8, 5))
 
     for method in methods:
 
         method_df = df[df["method"] == method].copy()
-        compression = method_df["compression_rate"].replace({0.0: pd.NA})
-        total_params = method_df["kept_params"] / compression
-        method_df["total_params"] = total_params.fillna(method_df["kept_params"])
-        method_df["pruned_params"] = (
-            method_df["total_params"] - method_df["kept_params"]
-        ).clip(lower=0)
-        method_df["pruned_percent"] = (
-            method_df["pruned_params"]
-            / method_df["total_params"].where(method_df["total_params"] > 0, pd.NA)
-        ) * 100.0
-        method_df["pruned_percent"] = method_df["pruned_percent"].fillna(0.0)
 
-        method_df = method_df.sort_values("pruned_params")
+        method_df = method_df.sort_values("pruned_percent")
         zero_subset = method_df[method_df["ft_epochs"] == 0]
-
-        zero_subset = zero_subset[zero_subset["pruned_params"] > 0]
-
         if zero_subset.empty:
             continue
         color = COLORS.get(method)
-        zero_x = zero_subset["pruned_params"] / 1_000_000.0
-
+        zero_subset = zero_subset.assign(percent_key=zero_subset["pruned_percent"].round(5))
+        zero_x = zero_subset["percent_key"].map(position_map)
         ax.plot(
 
             zero_x,
@@ -107,7 +109,9 @@ def create_plot(
 
             ft_subset = ft_subset[ft_subset["pruned_params"] > 0]
             if not ft_subset.empty:
-                ft_x = ft_subset["pruned_params"] / 1_000_000.0
+
+                ft_subset = ft_subset.assign(percent_key=ft_subset["pruned_percent"].round(5))
+                ft_x = ft_subset["percent_key"].map(position_map)
                 ax.plot(
 
                     ft_x,
@@ -119,8 +123,11 @@ def create_plot(
                 )
 
 
-    ax.set_xscale("log")
-    ax.set_xlabel("Parameters pruned (log scale, millions)")
+    ax.set_xscale("linear")
+    ax.set_xlim(-0.5, len(percent_keys) - 0.5)
+    ax.set_xticks(range(len(percent_keys)))
+    ax.set_xticklabels([f"{pct:.1f}%" for pct in percent_keys])
+    ax.set_xlabel("Parameters pruned (%)")
     ax.set_ylabel("Top-1 Accuracy (%)")
 
     title = "Accuracy vs Parameter Count"

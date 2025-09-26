@@ -1,7 +1,7 @@
 # NeronRank — Minimal, Reproducible ResNet Pruning Benchmarks (CUDA)
 
 > **Goal**: Provide a clean, minimal codebase to compare **Magnitude (MB)** vs **NeuronRank (NR; TF‑IDF activation scoring)** vs **First‑Order (FO; Taylor |g·w|)** for **MLP (neuron) pruning** on **ResNet** with pre‑trained **Hugging Face** checkpoints.  
-> We measure **zero‑shot** and **+1‑epoch fine‑tune (FT) recovery**, log **compute costs**, and plot **Accuracy vs *Parameter Count*** (X axis = *number of params kept*, not compression rate).  
+> We measure **zero‑shot** and **+1‑epoch fine‑tune (FT) recovery**, log **compute costs**, and plot **Accuracy vs *Parameter Count*** (X axis = *percent of params pruned*, evenly spaced for comparison).  
 > We implement **two statistics modes**:  
 > 1) **before**: record **module inputs** (default; our existing behavior),  
 > 2) **post**: record **post‑activation** activity,  
@@ -268,7 +268,9 @@ Saved to: `--output-dir/metrics.csv`
 
 ### 7) Plots (`viz/plots.py`)
 - **Accuracy vs Parameter Count**: one line per method (MB, NR, FO), for the chosen `--statistics` mode.
-  - X = log-scaled absolute parameters pruned (millions) with per-point `% pruned` labels;
+
+  - X = evenly spaced `% parameters pruned` tick labels so sparsities align across methods;
+
     Y = `accuracy` (zero-shot and FT as separate markers or styles).
   - Outputs: `--output-dir/acc_vs_params.png` plus per‑statistics variants (e.g. `acc_vs_params_post.png`).
 
