@@ -68,6 +68,7 @@ def create_plot(
     for method in methods:
 
         method_df = df[df["method"] == method].copy()
+
         method_df = method_df.sort_values("pruned_percent")
         zero_subset = method_df[method_df["ft_epochs"] == 0]
         if zero_subset.empty:
@@ -76,6 +77,7 @@ def create_plot(
         zero_subset = zero_subset.assign(percent_key=zero_subset["pruned_percent"].round(5))
         zero_x = zero_subset["percent_key"].map(position_map)
         ax.plot(
+
             zero_x,
             zero_subset["zero_shot_acc_top1"],
 
@@ -84,14 +86,34 @@ def create_plot(
             color=color,
         )
 
+        for x_val, pct in zip(zero_x, zero_subset["pruned_percent"]):
+            if pd.isna(x_val) or pd.isna(pct):
+                continue
+            ax.annotate(
+                f"{pct:.1f}%",
+                (x_val, 0),
+                xycoords=("data", "axes fraction"),
+                textcoords="offset points",
+                xytext=(0, -12),
+                ha="center",
+                va="top",
+
+                color=color,
+                fontsize=8,
+            )
+
         if with_ft:
             ft_subset = method_df[method_df["ft_epochs"] > 0].dropna(
                 subset=["ft_acc_top1"]
             )
+
+            ft_subset = ft_subset[ft_subset["pruned_params"] > 0]
             if not ft_subset.empty:
+
                 ft_subset = ft_subset.assign(percent_key=ft_subset["pruned_percent"].round(5))
                 ft_x = ft_subset["percent_key"].map(position_map)
                 ax.plot(
+
                     ft_x,
                     ft_subset["ft_acc_top1"],
                     label=f"{method} (+FT)",
@@ -100,12 +122,14 @@ def create_plot(
                     color=color,
                 )
 
+
     ax.set_xscale("linear")
     ax.set_xlim(-0.5, len(percent_keys) - 0.5)
     ax.set_xticks(range(len(percent_keys)))
     ax.set_xticklabels([f"{pct:.1f}%" for pct in percent_keys])
     ax.set_xlabel("Parameters pruned (%)")
     ax.set_ylabel("Top-1 Accuracy (%)")
+
     title = "Accuracy vs Parameter Count"
     if statistics is not None:
         title += f" [{statistics}]"

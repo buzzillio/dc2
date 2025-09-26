@@ -268,7 +268,9 @@ Saved to: `--output-dir/metrics.csv`
 
 ### 7) Plots (`viz/plots.py`)
 - **Accuracy vs Parameter Count**: one line per method (MB, NR, FO), for the chosen `--statistics` mode.
+
   - X = evenly spaced `% parameters pruned` tick labels so sparsities align across methods;
+
     Y = `accuracy` (zero-shot and FT as separate markers or styles).
   - Outputs: `--output-dir/acc_vs_params.png` plus per‑statistics variants (e.g. `acc_vs_params_post.png`).
 
