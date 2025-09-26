@@ -512,8 +512,24 @@ def _ensure_residual_alignment(
     if identity_channels is None:
         return
     downsample = getattr(block, "downsample", None)
+
+    if isinstance(downsample, ChannelSelect):
+        if identity_channels == output_channels:
+            block.downsample = None
+        else:
+            block.downsample = ChannelSelect(keep.tolist())
+        return
+
+    if isinstance(downsample, ChannelPad):
+        if identity_channels == output_channels:
+            block.downsample = None
+        else:
+            block.downsample = ChannelPad(keep.tolist(), output_channels)
+        return
+
     if downsample is not None:
-        # Existing downsample will be updated separately when needed.
+        # Existing downsample (e.g. a convolutional projection) will be updated
+        # separately when needed.
         return
     if identity_channels == output_channels:
         return
