@@ -47,29 +47,62 @@ def create_plot(
 
 
     methods = sorted(df["method"].unique())
-    plt.figure(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     for method in methods:
 
-        method_df = df[df["method"] == method].sort_values("kept_params")
+        method_df = df[df["method"] == method].copy()
+        compression = method_df["compression_rate"].replace({0.0: pd.NA})
+        total_params = method_df["kept_params"] / compression
+        method_df["total_params"] = total_params.fillna(method_df["kept_params"])
+        method_df["pruned_params"] = (
+            method_df["total_params"] - method_df["kept_params"]
+        ).clip(lower=0)
+        method_df["pruned_percent"] = (
+            method_df["pruned_params"]
+            / method_df["total_params"].where(method_df["total_params"] > 0, pd.NA)
+        ) * 100.0
+        method_df["pruned_percent"] = method_df["pruned_percent"].fillna(0.0)
+
+        method_df = method_df.sort_values("pruned_params")
         zero_subset = method_df[method_df["ft_epochs"] == 0]
+        zero_subset = zero_subset[zero_subset["pruned_params"] > 0]
+        if zero_subset.empty:
+            continue
         color = COLORS.get(method)
-        plt.plot(
-            zero_subset["kept_params"] / 1_000_000.0,
+        zero_x = zero_subset["pruned_params"] / 1_000_000.0
+        ax.plot(
+            zero_x,
             zero_subset["zero_shot_acc_top1"],
 
             label=f"{method} (zero-shot)",
             marker="o",
             color=color,
         )
+        for x_val, pct in zip(zero_x, zero_subset["pruned_percent"]):
+            if pd.isna(x_val) or pd.isna(pct):
+                continue
+            ax.annotate(
+                f"{pct:.1f}%",
+                (x_val, 0),
+                xycoords=("data", "axes fraction"),
+                textcoords="offset points",
+                xytext=(0, -12),
+                ha="center",
+                va="top",
+                color=color,
+                fontsize=8,
+            )
 
         if with_ft:
             ft_subset = method_df[method_df["ft_epochs"] > 0].dropna(
                 subset=["ft_acc_top1"]
             )
+            ft_subset = ft_subset[ft_subset["pruned_params"] > 0]
             if not ft_subset.empty:
-                plt.plot(
-                    ft_subset["kept_params"] / 1_000_000.0,
+                ft_x = ft_subset["pruned_params"] / 1_000_000.0
+                ax.plot(
+                    ft_x,
                     ft_subset["ft_acc_top1"],
                     label=f"{method} (+FT)",
                     marker="x",
@@ -77,20 +110,21 @@ def create_plot(
                     color=color,
                 )
 
-    plt.xlabel("#Parameters kept (millions)")
-    plt.ylabel("Top-1 Accuracy (%)")
+    ax.set_xscale("log")
+    ax.set_xlabel("Parameters pruned (log scale, millions)")
+    ax.set_ylabel("Top-1 Accuracy (%)")
     title = "Accuracy vs Parameter Count"
     if statistics is not None:
         title += f" [{statistics}]"
-    plt.title(title)
+    ax.set_title(title)
 
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path)
-    plt.close()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def main(args: argparse.Namespace) -> None:

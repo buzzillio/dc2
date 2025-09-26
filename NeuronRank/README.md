@@ -142,6 +142,14 @@ python -m neuronrank.cli \
   --cuda
 ```
 
+### Scope options (`--scope`)
+
+- `fc` *(default)* — prune only the classifier input features (per-neuron pruning of the final linear layer).
+- `cl` — **layer-level** pruning. Aggregates NR/MB/FO scores per residual block,
+  plans which blocks to disable, and rewrites the model to preserve residual
+  alignment while dropping entire blocks.
+- `all` — structured channel pruning across all residual blocks with per-layer sparsity caps.
+
 **Switch to post‑activation statistics:**
 ```bash
 --statistics post
@@ -240,7 +248,7 @@ Row per (method × statistics × sparsity):
 | device | cuda:0 or cpu |
 | dataset | cifar10 or imagenet |
 | hf_model_id | string |
-| layer | “fc” |
+| layer | scope identifier (e.g., “fc”, “layers”, “all”) |
 | method | MB / NR / FO |
 | statistics | before / post |
 | sparsity | float (e.g., 0.7) |
@@ -260,7 +268,8 @@ Saved to: `--output-dir/metrics.csv`
 
 ### 7) Plots (`viz/plots.py`)
 - **Accuracy vs Parameter Count**: one line per method (MB, NR, FO), for the chosen `--statistics` mode.
-  - X = `kept_params` (in millions), Y = `accuracy` (zero‑shot and FT as separate markers or styles).
+  - X = log-scaled absolute parameters pruned (millions) with per-point `% pruned` labels;
+    Y = `accuracy` (zero-shot and FT as separate markers or styles).
   - Outputs: `--output-dir/acc_vs_params.png` plus per‑statistics variants (e.g. `acc_vs_params_post.png`).
 
 ---
