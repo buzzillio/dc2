@@ -47,7 +47,7 @@ def create_plot(
 
 
     methods = sorted(df["method"].unique())
-    plt.figure(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     for method in methods:
 
@@ -73,7 +73,9 @@ def create_plot(
             continue
         color = COLORS.get(method)
         zero_x = zero_subset["pruned_params"] / 1_000_000.0
-        plt.plot(
+
+        ax.plot(
+
             zero_x,
             zero_subset["zero_shot_acc_top1"],
 
@@ -81,19 +83,19 @@ def create_plot(
             marker="o",
             color=color,
         )
-        for x_val, y_val, pct in zip(
-            zero_x,
-            zero_subset["zero_shot_acc_top1"],
-            zero_subset["pruned_percent"],
-        ):
-            if pd.isna(x_val) or pd.isna(y_val) or pd.isna(pct):
+
+        for x_val, pct in zip(zero_x, zero_subset["pruned_percent"]):
+            if pd.isna(x_val) or pd.isna(pct):
                 continue
-            plt.annotate(
+            ax.annotate(
                 f"{pct:.1f}%",
-                (x_val, y_val),
+                (x_val, 0),
+                xycoords=("data", "axes fraction"),
                 textcoords="offset points",
                 xytext=(0, -12),
                 ha="center",
+                va="top",
+
                 color=color,
                 fontsize=8,
             )
@@ -104,10 +106,10 @@ def create_plot(
             )
 
             ft_subset = ft_subset[ft_subset["pruned_params"] > 0]
-
             if not ft_subset.empty:
                 ft_x = ft_subset["pruned_params"] / 1_000_000.0
-                plt.plot(
+                ax.plot(
+
                     ft_x,
                     ft_subset["ft_acc_top1"],
                     label=f"{method} (+FT)",
@@ -116,39 +118,23 @@ def create_plot(
                     color=color,
                 )
 
-                for x_val, y_val, pct in zip(
-                    ft_x,
-                    ft_subset["ft_acc_top1"],
-                    ft_subset["pruned_percent"],
-                ):
-                    if pd.isna(x_val) or pd.isna(y_val) or pd.isna(pct):
-                        continue
-                    plt.annotate(
-                        f"{pct:.1f}%",
-                        (x_val, y_val),
-                        textcoords="offset points",
-                        xytext=(0, -12),
-                        ha="center",
-                        color=color,
-                        fontsize=8,
-                    )
 
-    plt.xscale("log")
-    plt.xlabel("Parameters pruned (log scale, millions)")
+    ax.set_xscale("log")
+    ax.set_xlabel("Parameters pruned (log scale, millions)")
+    ax.set_ylabel("Top-1 Accuracy (%)")
 
-    plt.ylabel("Top-1 Accuracy (%)")
     title = "Accuracy vs Parameter Count"
     if statistics is not None:
         title += f" [{statistics}]"
-    plt.title(title)
+    ax.set_title(title)
 
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path)
-    plt.close()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def main(args: argparse.Namespace) -> None:
