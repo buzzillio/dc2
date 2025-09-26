@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imagenet-val", type=str, default=None)
     parser.add_argument("--methods", type=parse_methods, default=parse_methods("NR,MB,FO"))
     parser.add_argument("--statistics", type=str, default="before")
-    parser.add_argument("--scope", type=str, choices=("fc", "all"), default="fc")
+    parser.add_argument("--scope", type=str, choices=("fc", "cl", "all"), default="fc")
     parser.add_argument(
         "--sparsities",
         type=parse_sparsities,
@@ -343,10 +343,14 @@ def run(args: argparse.Namespace) -> None:
     logger = CSVLogger(str(metrics_path))
     statistics_modes = compute_statistics_modes(args.statistics)
     channel_targets: List[channel.ChannelTarget] = []
-    if args.scope == "all":
+    if args.scope in {"cl", "all"}:
         channel_targets = channel.discover_resnet_targets(
             base_bundle.model, base_bundle.classifier_name
         )
+        if args.scope == "cl":
+            channel_targets = [
+                target for target in channel_targets if "." in target.conv
+            ]
 
     classifier_per_feature: Tuple[int, int] | None = None
     if args.scope == "fc":
@@ -357,6 +361,10 @@ def run(args: argparse.Namespace) -> None:
             target.name: channel.compute_target_footprint(base_bundle.model, target)
             for target in channel_targets
         }
+
+    layer_footprints: Dict[str, int] = {}
+    if args.scope == "cl":
+        layer_footprints = channel.estimate_layer_footprints(base_bundle, channel_targets)
 
     total_target_params = sum(fp.total_params for fp in target_footprints.values())
 
@@ -458,7 +466,7 @@ def run(args: argparse.Namespace) -> None:
                             flush=True,
                         )
 
-            else:
+            elif args.scope == "all":
                 for sparsity in args.sparsities:
                     working_bundle = base_bundle
                     total_kept = 0
@@ -536,6 +544,80 @@ def run(args: argparse.Namespace) -> None:
                         logger.log(MetricRow(**row_data))
                     print(
                         "[NeuronRank] Logged results | method={} | stats={} | sparsity={:.2f}".format(
+                            method, stats_mode, sparsity
+                        ),
+                        flush=True,
+                    )
+
+            else:  # scope == "cl"
+                aggregated_scores = channel.aggregate_layer_scores(scores)
+                for sparsity in args.sparsities:
+                    plan = channel.plan_layer_pruning(
+                        aggregated_scores, channel_targets, layer_footprints, sparsity
+                    )
+                    working_bundle = channel.apply_layer_plan(
+                        base_bundle, channel_targets, plan
+                    )
+                    working_bundle.model.to(device)
+                    compression = plan.compression
+                    effective = 1.0 - compression
+                    print(
+                        "[NeuronRank] Evaluating layer sparsity={:.2f} ({}|{}) -> effective={:.2f}".format(
+                            sparsity, method, stats_mode, effective
+                        ),
+                        flush=True,
+                    )
+
+                    zero_acc, eval_time = evaluate_model(working_bundle, loaders.eval, device)
+
+                    timestamp = datetime.utcnow().isoformat()
+                    kept_params = int(plan.kept_params)
+                    row_data = dict(
+                        timestamp=timestamp,
+                        seed=seed,
+                        device=str(device),
+                        dataset=args.dataset,
+                        hf_model_id=args.hf_model_id,
+                        layer="layers",
+                        method=method,
+                        statistics=stats_mode,
+                        sparsity=sparsity,
+                        kept_params=kept_params,
+                        zero_shot_acc_top1=zero_acc,
+                        zero_shot_eval_time_s=eval_time,
+                        score_time_s=score_time,
+                        score_peak_mem_mb=peak_mem,
+                        ft_epochs=0,
+                        ft_epoch_time_avg_s=0.0,
+                        ft_total_time_s=0.0,
+                        ft_acc_top1=float("nan"),
+                        compression_rate=compression,
+                        notes=args.notes,
+                    )
+                    logger.log(MetricRow(**row_data))
+
+                    if args.recover_epochs > 0:
+                        ft_acc, ft_total_time, ft_epoch_avg = finetune(
+                            working_bundle,
+                            loaders,
+                            device,
+                            args.recover_epochs,
+                            args.lr,
+                            args.weight_decay,
+                            args.momentum,
+                            args.amp,
+                            args.log_interval,
+                        )
+                        row_data.update(
+                            ft_epochs=args.recover_epochs,
+                            ft_acc_top1=ft_acc,
+                            ft_total_time_s=ft_total_time,
+                            ft_epoch_time_avg_s=ft_epoch_avg,
+                        )
+                        logger.log(MetricRow(**row_data))
+
+                    print(
+                        "[NeuronRank] Logged layer results | method={} | stats={} | sparsity={:.2f}".format(
                             method, stats_mode, sparsity
                         ),
                         flush=True,
