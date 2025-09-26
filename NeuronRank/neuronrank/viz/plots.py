@@ -66,7 +66,9 @@ def create_plot(
 
         method_df = method_df.sort_values("pruned_params")
         zero_subset = method_df[method_df["ft_epochs"] == 0]
+
         zero_subset = zero_subset[zero_subset["pruned_params"] > 0]
+
         if zero_subset.empty:
             continue
         color = COLORS.get(method)
@@ -100,7 +102,9 @@ def create_plot(
             ft_subset = method_df[method_df["ft_epochs"] > 0].dropna(
                 subset=["ft_acc_top1"]
             )
+
             ft_subset = ft_subset[ft_subset["pruned_params"] > 0]
+
             if not ft_subset.empty:
                 ft_x = ft_subset["pruned_params"] / 1_000_000.0
                 plt.plot(
@@ -111,6 +115,7 @@ def create_plot(
                     linestyle="--",
                     color=color,
                 )
+
                 for x_val, y_val, pct in zip(
                     ft_x,
                     ft_subset["ft_acc_top1"],
@@ -130,6 +135,7 @@ def create_plot(
 
     plt.xscale("log")
     plt.xlabel("Parameters pruned (log scale, millions)")
+
     plt.ylabel("Top-1 Accuracy (%)")
     title = "Accuracy vs Parameter Count"
     if statistics is not None:
