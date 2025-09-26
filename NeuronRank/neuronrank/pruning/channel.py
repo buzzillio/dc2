@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -72,6 +73,23 @@ class ChannelFootprint:
 
     per_channel_params: int
     total_params: int
+
+
+@dataclass
+class LayerPruningPlan:
+    """Plan describing which residual blocks should be disabled."""
+
+    disabled: List[str]
+    kept: List[str]
+    removed_params: int
+    kept_params: int
+    total_params: int
+
+    @property
+    def compression(self) -> float:
+        if self.total_params <= 0:
+            return 1.0
+        return float(self.kept_params) / float(self.total_params)
 
 
 
@@ -228,6 +246,154 @@ def compute_target_footprint(model: nn.Module, target: ChannelTarget) -> Channel
 
     total = per_channel * target.out_channels
     return ChannelFootprint(per_channel_params=int(per_channel), total_params=int(total))
+
+
+class ResidualBypass(nn.Module):
+    """Residual block replacement that preserves the skip connection."""
+
+    def __init__(self, downsample: Optional[nn.Module]):
+        super().__init__()
+        if downsample is None:
+            self.downsample = None
+        else:
+            self.downsample = copy.deepcopy(downsample)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if self.downsample is not None:
+            return self.downsample(x)
+        return x
+
+
+def _stage_identifier(target_name: str) -> str:
+    if target_name.startswith("layer"):
+        return target_name.split(".", 1)[0]
+    return target_name
+
+
+def aggregate_layer_scores(scores: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Reduce per-channel scores to layer-level scalars."""
+
+    aggregated: Dict[str, torch.Tensor] = {}
+    for name, tensor in scores.items():
+        if tensor.numel() == 0:
+            aggregated[name] = torch.tensor(0.0)
+        else:
+            aggregated[name] = tensor.float().mean()
+    return aggregated
+
+
+def plan_layer_pruning(
+    scores: Dict[str, torch.Tensor],
+    targets: Sequence[ChannelTarget],
+    footprints: Dict[str, int],
+    sparsity: float,
+) -> LayerPruningPlan:
+    """Determine which residual blocks to disable for a target sparsity."""
+
+    considered_targets = [t for t in targets if t.name in scores and t.name in footprints]
+    considered_names = {t.name for t in considered_targets}
+    total_params = int(sum(footprints[name] for name in considered_names))
+    if total_params <= 0 or not considered_targets:
+        kept_names = [t.name for t in considered_targets]
+        total_nonneg = max(total_params, 0)
+        return LayerPruningPlan([], kept_names, 0, total_nonneg, total_nonneg)
+
+    stage_map: Dict[str, List[ChannelTarget]] = {}
+    for target in considered_targets:
+        stage = _stage_identifier(target.name)
+        stage_map.setdefault(stage, []).append(target)
+
+    stage_limits: Dict[str, int] = {}
+    for stage, stage_targets in stage_map.items():
+        representative = stage_targets[0]
+        allowed = math.floor(len(stage_targets) * representative.max_sparsity + 1e-8)
+        allowed = min(allowed, len(stage_targets))
+        stage_limits[stage] = allowed
+
+    ranking: List[Tuple[float, float, ChannelTarget]] = []
+    for target in considered_targets:
+        cost = float(footprints[target.name])
+        if cost <= 0:
+            continue
+        score = float(scores[target.name].item())
+        ratio = score / cost if cost > 0 else float("inf")
+        ranking.append((ratio, score, target))
+
+    ranking.sort(key=lambda item: (item[0], item[1]))
+
+    remove_budget = max(0.0, float(total_params) * float(sparsity))
+    removed = 0.0
+    disabled: List[str] = []
+    stage_disabled: Dict[str, int] = {stage: 0 for stage in stage_map}
+
+    for _ratio, _score, target in ranking:
+        stage = _stage_identifier(target.name)
+        max_disable = stage_limits.get(stage, len(stage_map.get(stage, [])))
+        if max_disable == 0 or stage_disabled.get(stage, 0) >= max_disable:
+            continue
+        cost = float(footprints[target.name])
+        if cost <= 0:
+            continue
+        new_removed = removed + cost
+        if removed < remove_budget or abs(remove_budget - removed) >= abs(remove_budget - new_removed):
+            disabled.append(target.name)
+            stage_disabled[stage] = stage_disabled.get(stage, 0) + 1
+            removed = new_removed
+
+    disabled_set = set(disabled)
+    kept_names = [t.name for t in considered_targets if t.name not in disabled_set]
+    removed_params = int(round(min(removed, float(total_params))))
+    kept_params = int(max(0.0, float(total_params) - removed_params))
+    return LayerPruningPlan(list(disabled_set), kept_names, removed_params, kept_params, total_params)
+
+
+def _disable_block(bundle: ModelBundle, target: ChannelTarget) -> ModelBundle:
+    if "." not in target.conv:
+        raise ValueError("Layer-level pruning requires block targets with hierarchical names")
+    new_model = copy.deepcopy(bundle.model)
+    block_name = target.conv.rsplit(".", 1)[0]
+    block = _get_module(new_model, block_name)
+    downsample = getattr(block, "downsample", None)
+    bypass = ResidualBypass(downsample)
+    _set_module(new_model, block_name, bypass)
+    return ModelBundle(
+        model=new_model,
+        classifier=_get_module(new_model, bundle.classifier_name),  # type: ignore[assignment]
+        classifier_name=bundle.classifier_name,
+        feature_dim=bundle.feature_dim,
+    )
+
+
+def apply_layer_plan(
+    bundle: ModelBundle,
+    targets: Sequence[ChannelTarget],
+    plan: LayerPruningPlan,
+) -> ModelBundle:
+    """Apply a layer-level pruning plan to the model."""
+
+    working = bundle
+    disabled = set(plan.disabled)
+    for target in targets:
+        if target.name in disabled:
+            working = _disable_block(working, target)
+    return working
+
+
+def estimate_layer_footprints(
+    bundle: ModelBundle, targets: Sequence[ChannelTarget]
+) -> Dict[str, int]:
+    """Estimate parameter reductions for disabling each residual block."""
+
+    base_params = count_parameters(bundle.model)
+    footprints: Dict[str, int] = {}
+    for target in targets:
+        if "." not in target.conv:
+            continue
+        pruned_bundle = _disable_block(bundle, target)
+        pruned_params = count_parameters(pruned_bundle.model)
+        reduction = max(0, base_params - pruned_params)
+        footprints[target.name] = reduction
+    return footprints
 
 
 
